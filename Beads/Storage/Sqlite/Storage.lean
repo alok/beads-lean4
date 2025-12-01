@@ -75,9 +75,21 @@ def create (dbPath : System.FilePath) : IO (Except String SqliteStorage) := do
       let idGenState ← IO.mkRef { existingIds := existingIds }
       return .ok { db, dbPath, idGenState }
 where
-  loadExistingIds (_db : Database) : IO (List String) := do
-    -- TODO: Fix FFI issue with step loop
-    return []
+  loadExistingIds (db : Database) : IO (List String) := do
+    match ← prepare db "SELECT id FROM issues" with
+    | .error _ => return []
+    | .ok stmt =>
+      let mut ids : List String := []
+      let mut running := true
+      while running do
+        let rc ← step stmt
+        if rc == SQLITE_ROW then
+          let id ← columnText stmt 0
+          ids := id :: ids
+        else
+          running := false
+      finalize stmt
+      return ids
 
 /-- Parse status from string -/
 private def parseStatus (s : String) : Status :=

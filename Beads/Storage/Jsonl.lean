@@ -162,7 +162,7 @@ def computeBlockedSetImpl (issues : List (IssueId × Issue)) (deps : List Depend
 
 /-- Create storage operations from JsonlStorage -/
 def toStorageOps (storage : JsonlStorage) : StorageOps := {
-  createIssue := fun issue actor => do
+  createIssue := fun issue _actor => do
     let idState ← storage.idGenState.get
     let (newId, newIdState) := IdGenerator.generateId idState issue.title issue.description issue.createdAt
     storage.idGenState.set newIdState
