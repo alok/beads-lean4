@@ -114,6 +114,21 @@ private def parseDepType (s : String) : DependencyType :=
   | some t => t
   | none => .blocks
 
+/-- Read a dependency from a statement (assumes positioned on a row) -/
+private def readDependency (stmt : Statement) : IO Dependency := do
+  let issueId ← columnText stmt 0
+  let dependsOnId ← columnText stmt 1
+  let depType ← columnText stmt 2
+  let createdAt ← columnInt stmt 3
+  let createdBy ← columnText stmt 4
+  return {
+    issueId := ⟨issueId⟩
+    dependsOnId := ⟨dependsOnId⟩
+    depType := parseDepType depType
+    createdAt := createdAt.toNat
+    createdBy
+  }
+
 /-- Read an issue from a statement (assumes positioned on a row) -/
 private def readIssue (stmt : Statement) : IO Issue := do
   let id ← columnText stmt 0
@@ -246,18 +261,7 @@ def toStorageOps (storage : SqliteStorage) : StorageOps := {
     let sql := "SELECT id, title, description, design, acceptance_criteria, notes, status, priority, issue_type, assignee, estimated_minutes, created_at, updated_at, closed_at, close_reason, external_ref FROM issues"
     match ← prepare storage.db sql with
     | .error _ => return []
-    | .ok stmt =>
-      let mut issues : List Issue := []
-      let mut running := true
-      while running do
-        let rc ← step stmt
-        if rc == SQLITE_ROW then
-          let issue ← readIssue stmt
-          issues := issue :: issues
-        else
-          running := false
-      finalize stmt
-      return issues
+    | .ok stmt => Statement.collectRows stmt readIssue
 
   searchIssues := fun filter => do
     -- Build WHERE clause
@@ -278,18 +282,7 @@ def toStorageOps (storage : SqliteStorage) : StorageOps := {
 
     match ← prepare storage.db sql with
     | .error _ => return []
-    | .ok stmt =>
-      let mut issues : List Issue := []
-      let mut running := true
-      while running do
-        let rc ← step stmt
-        if rc == SQLITE_ROW then
-          let issue ← readIssue stmt
-          issues := issue :: issues
-        else
-          running := false
-      finalize stmt
-      return issues
+    | .ok stmt => Statement.collectRows stmt readIssue
 
   addDependency := fun dep _actor => do
     -- Check for cycles first using BFS
@@ -316,64 +309,19 @@ def toStorageOps (storage : SqliteStorage) : StorageOps := {
     let sql := s!"SELECT issue_id, depends_on_id, dep_type, created_at, created_by FROM dependencies WHERE issue_id = '{issueId.value}'"
     match ← prepare storage.db sql with
     | .error _ => return []
-    | .ok stmt =>
-      let mut deps : List Dependency := []
-      let mut running := true
-      while running do
-        let rc ← step stmt
-        if rc == SQLITE_ROW then
-          let issueId ← columnText stmt 0
-          let dependsOnId ← columnText stmt 1
-          let depType ← columnText stmt 2
-          let createdAt ← columnInt stmt 3
-          let createdBy ← columnText stmt 4
-          deps := { issueId := ⟨issueId⟩, dependsOnId := ⟨dependsOnId⟩, depType := parseDepType depType, createdAt := createdAt.toNat, createdBy } :: deps
-        else
-          running := false
-      finalize stmt
-      return deps
+    | .ok stmt => Statement.collectRows stmt readDependency
 
   getDependents := fun issueId => do
     let sql := s!"SELECT issue_id, depends_on_id, dep_type, created_at, created_by FROM dependencies WHERE depends_on_id = '{issueId.value}'"
     match ← prepare storage.db sql with
     | .error _ => return []
-    | .ok stmt =>
-      let mut deps : List Dependency := []
-      let mut running := true
-      while running do
-        let rc ← step stmt
-        if rc == SQLITE_ROW then
-          let issueId ← columnText stmt 0
-          let dependsOnId ← columnText stmt 1
-          let depType ← columnText stmt 2
-          let createdAt ← columnInt stmt 3
-          let createdBy ← columnText stmt 4
-          deps := { issueId := ⟨issueId⟩, dependsOnId := ⟨dependsOnId⟩, depType := parseDepType depType, createdAt := createdAt.toNat, createdBy } :: deps
-        else
-          running := false
-      finalize stmt
-      return deps
+    | .ok stmt => Statement.collectRows stmt readDependency
 
   getAllDependencies := do
     let sql := "SELECT issue_id, depends_on_id, dep_type, created_at, created_by FROM dependencies"
     match ← prepare storage.db sql with
     | .error _ => return []
-    | .ok stmt =>
-      let mut deps : List Dependency := []
-      let mut running := true
-      while running do
-        let rc ← step stmt
-        if rc == SQLITE_ROW then
-          let issueId ← columnText stmt 0
-          let dependsOnId ← columnText stmt 1
-          let depType ← columnText stmt 2
-          let createdAt ← columnInt stmt 3
-          let createdBy ← columnText stmt 4
-          deps := { issueId := ⟨issueId⟩, dependsOnId := ⟨dependsOnId⟩, depType := parseDepType depType, createdAt := createdAt.toNat, createdBy } :: deps
-        else
-          running := false
-      finalize stmt
-      return deps
+    | .ok stmt => Statement.collectRows stmt readDependency
 
   addLabel := fun issueId label _actor => do
     let sql := "INSERT OR IGNORE INTO labels (issue_id, label) VALUES (?, ?)"
@@ -474,33 +422,13 @@ where
     let sql := s!"SELECT label FROM labels WHERE issue_id = '{issueId.value}'"
     match ← prepare db sql with
     | .error _ => return []
-    | .ok stmt =>
-      let mut labels : List String := []
-      let mut running := true
-      while running do
-        let rc ← step stmt
-        if rc == SQLITE_ROW then
-          labels := (← columnText stmt 0) :: labels
-        else
-          running := false
-      finalize stmt
-      return labels
+    | .ok stmt => Statement.collectRows stmt (columnText · 0)
 
   getBlockersFor (db : Database) (issueId : IssueId) : IO (List IssueId) := do
     let sql := s!"SELECT d.depends_on_id FROM dependencies d JOIN issues i ON d.depends_on_id = i.id WHERE d.issue_id = '{issueId.value}' AND d.dep_type IN ('blocks', 'parent-child') AND i.status != 'closed'"
     match ← prepare db sql with
     | .error _ => return []
-    | .ok stmt =>
-      let mut blockers : List IssueId := []
-      let mut running := true
-      while running do
-        let rc ← step stmt
-        if rc == SQLITE_ROW then
-          blockers := ⟨← columnText stmt 0⟩ :: blockers
-        else
-          running := false
-      finalize stmt
-      return blockers
+    | .ok stmt => Statement.collectRows stmt (fun s => return ⟨← columnText s 0⟩)
 
   wouldCreateCycle (db : Database) (from_ to : IssueId) : IO Bool := do
     -- BFS from 'to' to see if we can reach 'from_'

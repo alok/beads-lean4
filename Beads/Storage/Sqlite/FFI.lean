@@ -151,6 +151,33 @@ def columnIntOpt (stmt : Statement) (idx : Nat) : IO (Option Int) := do
   else
     return some (← columnInt stmt idx)
 
+/-- Collect all rows from a statement using a row reader function -/
+def collectRows (stmt : Statement) (readRow : Statement → IO α) : IO (List α) := do
+  let mut rows : List α := []
+  let mut running := true
+  while running do
+    let rc ← step stmt
+    if rc == SQLITE_ROW then
+      let row ← readRow stmt
+      rows := row :: rows
+    else
+      running := false
+  finalize stmt
+  return rows.reverse
+
+/-- Collect all rows, with finalization handled separately -/
+def collectRowsNoFinalize (stmt : Statement) (readRow : Statement → IO α) : IO (List α) := do
+  let mut rows : List α := []
+  let mut running := true
+  while running do
+    let rc ← step stmt
+    if rc == SQLITE_ROW then
+      let row ← readRow stmt
+      rows := row :: rows
+    else
+      running := false
+  return rows.reverse
+
 end Statement
 
 end Beads.Sqlite
