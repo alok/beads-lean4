@@ -53,10 +53,12 @@ def formatIssueLong (issue : Issue) : String :=
   ]
   "\n".intercalate (lines.filter (!·.isEmpty))
 
-/-- Get current unix timestamp (simplified) -/
+/-- Get current unix timestamp from system -/
 def currentTimestamp : IO Nat := do
-  -- Use system time if available, otherwise return a placeholder
-  pure 1700000000  -- TODO: proper timestamp
+  let result ← IO.Process.output { cmd := "date", args := #["+%s"] }
+  match result.stdout.trim.toNat? with
+  | some n => pure n
+  | none => pure 0  -- Fallback if date command fails
 
 /-- Command: create a new issue -/
 def cmdCreate (cfg : CLIConfig) (args : List String) : IO UInt32 := do
@@ -353,6 +355,192 @@ def cmdClose (cfg : CLIConfig) (args : List String) : IO UInt32 := do
     IO.eprintln "Usage: beads close <id> [reason | --reason <text>]"
     pure 1
 
+/-- Command: add a label to an issue -/
+def cmdLabelAdd (cfg : CLIConfig) (args : List String) : IO UInt32 := do
+  match args with
+  | issueIdStr :: label :: _ =>
+    let storage ← JsonlStorage.openOrCreate cfg.beadsDir
+    let ops := storage.toStorageOps
+
+    let issueId : IssueId := ⟨issueIdStr⟩
+    match ← ops.getIssue issueId with
+    | some _ =>
+      ops.addLabel issueId label "cli"
+      ops.save
+      let labels ← ops.getLabels issueId
+      let json := Json.mkObj [("id", toJson issueId), ("labels", Json.arr (labels.map Json.str).toArray)]
+      let text := s!"Added label '{label}' to {issueIdStr}"
+      outputResult cfg json text
+      pure 0
+    | none =>
+      IO.eprintln s!"Error: Issue not found: {issueIdStr}"
+      pure 1
+  | _ =>
+    IO.eprintln "Error: label add requires issue ID and label"
+    IO.eprintln "Usage: beads label add <issue-id> <label>"
+    pure 1
+
+/-- Command: remove a label from an issue -/
+def cmdLabelRemove (cfg : CLIConfig) (args : List String) : IO UInt32 := do
+  match args with
+  | issueIdStr :: label :: _ =>
+    let storage ← JsonlStorage.openOrCreate cfg.beadsDir
+    let ops := storage.toStorageOps
+
+    let issueId : IssueId := ⟨issueIdStr⟩
+    match ← ops.getIssue issueId with
+    | some _ =>
+      ops.removeLabel issueId label "cli"
+      ops.save
+      let labels ← ops.getLabels issueId
+      let json := Json.mkObj [("id", toJson issueId), ("labels", Json.arr (labels.map Json.str).toArray)]
+      let text := s!"Removed label '{label}' from {issueIdStr}"
+      outputResult cfg json text
+      pure 0
+    | none =>
+      IO.eprintln s!"Error: Issue not found: {issueIdStr}"
+      pure 1
+  | _ =>
+    IO.eprintln "Error: label remove requires issue ID and label"
+    IO.eprintln "Usage: beads label remove <issue-id> <label>"
+    pure 1
+
+/-- Command: list labels on an issue -/
+def cmdLabelList (cfg : CLIConfig) (args : List String) : IO UInt32 := do
+  match args.head? with
+  | some issueIdStr =>
+    let storage ← JsonlStorage.openOrCreate cfg.beadsDir
+    let ops := storage.toStorageOps
+
+    let issueId : IssueId := ⟨issueIdStr⟩
+    match ← ops.getIssue issueId with
+    | some _ =>
+      let labels ← ops.getLabels issueId
+      if cfg.jsonOutput then
+        let json := Json.arr (labels.map Json.str).toArray
+        IO.println json.compress
+      else
+        if labels.isEmpty then
+          IO.println s!"No labels on {issueIdStr}"
+        else
+          IO.println s!"Labels on {issueIdStr}: {", ".intercalate labels}"
+      pure 0
+    | none =>
+      IO.eprintln s!"Error: Issue not found: {issueIdStr}"
+      pure 1
+  | none =>
+    IO.eprintln "Error: label list requires an issue ID"
+    IO.eprintln "Usage: beads label list <issue-id>"
+    pure 1
+
+/-- Command: show statistics -/
+def cmdStats (cfg : CLIConfig) (_args : List String) : IO UInt32 := do
+  let storage ← JsonlStorage.openOrCreate cfg.beadsDir
+  let ops := storage.toStorageOps
+
+  let allIssues ← ops.getAllIssues
+  let blocked ← ops.getBlockedIssues
+  let ready ← ops.getReadyWork WorkFilter.default
+
+  let total := allIssues.length
+  let openCount := allIssues.filter (·.status == .open) |>.length
+  let inProgressCount := allIssues.filter (·.status == .inProgress) |>.length
+  let closedCount := allIssues.filter (·.status == .closed) |>.length
+  let blockedCount := blocked.length
+  let readyCount := ready.length
+
+  let stats : Statistics := {
+    totalIssues := total
+    openIssues := openCount
+    inProgressIssues := inProgressCount
+    closedIssues := closedCount
+    blockedIssues := blockedCount
+    readyIssues := readyCount
+    epicsEligibleForClosure := 0  -- TODO: implement
+  }
+
+  if cfg.jsonOutput then
+    IO.println (toJson stats).compress
+  else
+    IO.println s!"Total:       {total}"
+    IO.println s!"Open:        {openCount}"
+    IO.println s!"In Progress: {inProgressCount}"
+    IO.println s!"Closed:      {closedCount}"
+    IO.println s!"Blocked:     {blockedCount}"
+    IO.println s!"Ready:       {readyCount}"
+  pure 0
+
+/-- Helper for dependency tree collection -/
+def collectTreeLoop (ops : StorageOps) (allDeps : List Dependency) (rootId : IssueId)
+    (queue : List (IssueId × Nat)) (visited : Std.HashSet IssueId)
+    (acc : List TreeNode) (fuel : Nat) : IO (List TreeNode) := do
+  if fuel == 0 then pure acc.reverse
+  else match queue with
+  | [] => pure acc.reverse
+  | (id, depth) :: rest =>
+    if visited.contains id then
+      collectTreeLoop ops allDeps rootId rest visited acc (fuel - 1)
+    else
+      match ← ops.getIssue id with
+      | some issue =>
+        let node : TreeNode := {
+          issue := issue
+          depth := depth
+          parentId := if depth == 0 then none else some rootId
+          truncated := depth >= 5
+        }
+        if depth >= 5 then
+          collectTreeLoop ops allDeps rootId rest (visited.insert id) (node :: acc) (fuel - 1)
+        else
+          -- Get issues this one depends on (blocking dependencies)
+          let blocking := allDeps.filter fun d =>
+            d.issueId == id && d.depType.affectsBlocking
+          let children := blocking.map fun d => (d.dependsOnId, depth + 1)
+          collectTreeLoop ops allDeps rootId (rest ++ children) (visited.insert id) (node :: acc) (fuel - 1)
+      | none =>
+        collectTreeLoop ops allDeps rootId rest (visited.insert id) acc (fuel - 1)
+termination_by fuel
+decreasing_by all_goals simp_all; omega
+
+/-- Command: show dependency tree -/
+def cmdDepTree (cfg : CLIConfig) (args : List String) : IO UInt32 := do
+  match args.head? with
+  | some issueIdStr =>
+    let storage ← JsonlStorage.openOrCreate cfg.beadsDir
+    let ops := storage.toStorageOps
+
+    let issueId : IssueId := ⟨issueIdStr⟩
+    match ← ops.getIssue issueId with
+    | some _ =>
+      let allDeps ← ops.getAllDependencies
+      let tree ← collectTreeLoop ops allDeps issueId [(issueId, 0)] {} [] 100
+
+      if cfg.jsonOutput then
+        let json := Json.arr (tree.map fun node =>
+          Json.mkObj [
+            ("id", toJson node.issue.id),
+            ("title", Json.str node.issue.title),
+            ("status", toJson node.issue.status),
+            ("depth", Json.num node.depth),
+            ("truncated", Json.bool node.truncated)
+          ]
+        ).toArray
+        IO.println json.compress
+      else
+        for node in tree do
+          let indent := String.mk (List.replicate (node.depth * 2) ' ')
+          let statusMark := if node.issue.status == .closed then "✓" else "○"
+          let truncMark := if node.truncated then " ..." else ""
+          IO.println s!"{indent}{statusMark} {node.issue.id.value}: {node.issue.title}{truncMark}"
+      pure 0
+    | none =>
+      IO.eprintln s!"Error: Issue not found: {issueIdStr}"
+      pure 1
+  | none =>
+    IO.eprintln "Error: dep tree requires an issue ID"
+    IO.eprintln "Usage: beads dep tree <issue-id>"
+    pure 1
+
 /-- Command: show blocked issues -/
 def cmdBlocked (cfg : CLIConfig) (_args : List String) : IO UInt32 := do
   let storage ← JsonlStorage.openOrCreate cfg.beadsDir
@@ -386,9 +574,14 @@ def printHelp : IO Unit := do
   IO.println "  show <id>                      Show issue details"
   IO.println "  update <id> [options]          Update an issue"
   IO.println "  close <id> [reason]            Close an issue"
+  IO.println "  label add <id> <label>         Add label to issue"
+  IO.println "  label remove <id> <label>      Remove label from issue"
+  IO.println "  label list <id>                List labels on issue"
   IO.println "  dep add <from> <to> [--type]   Add dependency (from blocks to)"
+  IO.println "  dep tree <id>                  Show dependency tree"
   IO.println "  ready [filters]                Show ready (unblocked) work"
   IO.println "  blocked                        Show blocked issues"
+  IO.println "  stats                          Show issue statistics"
   IO.println "  help                           Show this help"
   IO.println ""
   IO.println "Flags:"
@@ -428,9 +621,15 @@ def main (args : List String) : IO UInt32 := do
   | "show" :: rest => cmdShow cfg rest
   | "update" :: rest => cmdUpdate cfg rest
   | "close" :: rest => cmdClose cfg rest
+  | "label" :: "add" :: rest => cmdLabelAdd cfg rest
+  | "label" :: "remove" :: rest => cmdLabelRemove cfg rest
+  | "label" :: "list" :: rest => cmdLabelList cfg rest
+  | "label" :: rest => cmdLabelList cfg rest  -- Default to list
   | "dep" :: "add" :: rest => cmdDepAdd cfg rest
+  | "dep" :: "tree" :: rest => cmdDepTree cfg rest
   | "ready" :: rest => cmdReady cfg rest
   | "blocked" :: rest => cmdBlocked cfg rest
+  | "stats" :: rest => cmdStats cfg rest
   | cmd :: _ =>
     IO.eprintln s!"Unknown command: {cmd}"
     IO.eprintln "Run 'beads help' for usage"
