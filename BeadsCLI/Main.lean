@@ -528,7 +528,7 @@ def cmdDepTree (cfg : CLIConfig) (args : List String) : IO UInt32 := do
         IO.println json.compress
       else
         for node in tree do
-          let indent := String.mk (List.replicate (node.depth * 2) ' ')
+          let indent := String.ofList (List.replicate (node.depth * 2) ' ')
           let statusMark := if node.issue.status == .closed then "✓" else "○"
           let truncMark := if node.truncated then " ..." else ""
           IO.println s!"{indent}{statusMark} {node.issue.id.value}: {node.issue.title}{truncMark}"
