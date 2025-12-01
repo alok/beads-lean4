@@ -21,3 +21,9 @@ lean_exe «beads» where
 lean_lib BeadsDocs where
   srcDir := "docs"
   roots := #[`Manual]
+
+-- Documentation generator executable
+lean_exe «beads-docs» where
+  srcDir := "docs"
+  root := `Main
+  supportInterpreter := true

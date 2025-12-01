@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Beads - Git-Backed Issue Tracker in Lean 4</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+    <style>
+        :root { --pico-font-size: 100%; }
+        pre { background: #1a1a2e; color: #eee; padding: 1rem; border-radius: 8px; overflow-x: auto; }
+        code { background: #f0f0f0; padding: 0.2em 0.4em; border-radius: 4px; }
+        pre code { background: none; padding: 0; }
+        .hero { text-align: center; padding: 2rem 0; }
+        .features { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 1rem; }
+        .feature { padding: 1rem; border: 1px solid var(--pico-muted-border-color); border-radius: 8px; }
+        nav { margin-bottom: 2rem; }
+        nav ul { display: flex; gap: 1rem; list-style: none; padding: 0; flex-wrap: wrap; }
+        h2 { margin-top: 2rem; border-bottom: 2px solid var(--pico-primary); padding-bottom: 0.5rem; }
+        h3 { margin-top: 1.5rem; }
+        .badge { display: inline-block; padding: 0.2em 0.6em; font-size: 0.8em; border-radius: 4px; background: var(--pico-primary); color: white; }
+    </style>
+</head>
+<body>
+<main class="container">
+    <header class="hero">
+        <h1>Beads</h1>
+        <p><strong>Git-Backed Distributed Issue Tracker in Lean 4</strong></p>
+        <p>
+            <span class="badge">Agent-Friendly</span>
+            <span class="badge">Type-Safe</span>
+            <span class="badge">JSON Output</span>
+        </p>
+    </header>
+
+    <nav>
+        <ul>
+            <li><a href="#quick-start">Quick Start</a></li>
+            <li><a href="#commands">Commands</a></li>
+            <li><a href="#json">JSON API</a></li>
+            <li><a href="#architecture">Architecture</a></li>
+            <li><a href="#examples">Examples</a></li>
+            <li><a href="https://github.com/alok/beads-lean4">GitHub</a></li>
+        </ul>
+    </nav>
+
+    <section class="features">
+        <article class="feature">
+            <h3>Git-Native</h3>
+            <p>Issues stored as JSONL files, perfect for version control and collaboration.</p>
+        </article>
+        <article class="feature">
+            <h3>Agent-Friendly</h3>
+            <p>Every command supports <code>--json</code> output for machine-readable results.</p>
+        </article>
+        <article class="feature">
+            <h3>Type-Safe</h3>
+            <p>Written in Lean 4 with compile-time guarantees and formal verification potential.</p>
+        </article>
+        <article class="feature">
+            <h3>Dependency-Aware</h3>
+            <p>Track blocking relationships with automatic cycle detection.</p>
+        </article>
+    </section>
+
+    <section id="quick-start">
+        <h2>Quick Start</h2>
+        <h3>Installation</h3>
+        <pre><code>git clone https://github.com/alok/beads-lean4
+cd beads-lean4
+lake build
+
+# Add to PATH (optional)
+export PATH="$PATH:$(pwd)/.lake/build/bin"</code></pre>
+
+        <h3>Create Your First Issue</h3>
+        <pre><code>$ beads create "Fix login bug" "Users cannot login with special chars"
+Created issue: bd-a1b2c3
+
+$ beads list
+bd-a1b2c3  [open] [P2] Fix login bug</code></pre>
+    </section>
+
+    <section id="commands">
+        <h2>Command Reference</h2>
+
+        <h3>Creating Issues</h3>
+        <pre><code>beads create "Title" "Description"
+beads --json create "Implement feature X"</code></pre>
+
+        <h3>Listing and Filtering</h3>
+        <pre><code>beads list                          # All issues
+beads list --status open            # Open only
+beads list --status in_progress     # In progress
+beads list --priority 0             # P0 (critical)
+beads list --search "bug"           # Search titles
+beads list --status open --limit 10 # Combined filters</code></pre>
+
+        <h3>Viewing Details</h3>
+        <pre><code>beads show bd-a1b2c3
+beads --json show bd-a1b2c3</code></pre>
+
+        <h3>Updating Issues</h3>
+        <pre><code>beads update bd-a1b2c3 --status in_progress
+beads update bd-a1b2c3 --priority 0 --assignee "alice"
+beads update bd-a1b2c3 --assignee none</code></pre>
+
+        <h3>Closing Issues</h3>
+        <pre><code>beads close bd-a1b2c3 "Fixed in commit abc123"</code></pre>
+
+        <h3>Labels</h3>
+        <pre><code>beads label add bd-a1b2c3 bug
+beads label add bd-a1b2c3 urgent
+beads label list bd-a1b2c3
+beads label remove bd-a1b2c3 urgent</code></pre>
+
+        <h3>Dependencies</h3>
+        <pre><code>beads dep add bd-blocked bd-blocker           # A blocks B
+beads dep add bd-child bd-parent --type parent-child
+beads dep tree bd-a1b2c3                      # Visualize tree</code></pre>
+
+        <h3>Workflow Commands</h3>
+        <pre><code>beads ready                    # Unblocked work
+beads ready --assignee alice   # Alice's ready work
+beads ready --unassigned       # Unclaimed work
+beads blocked                  # Blocked issues
+beads stats                    # Statistics</code></pre>
+    </section>
+
+    <section id="json">
+        <h2>JSON Output for Agents</h2>
+        <p>All commands support <code>--json</code> for machine-readable output:</p>
+
+        <pre><code>$ beads --json list
+[{"id":"bd-a1b2c3","title":"Fix bug","status":"open","priority":2,...}]
+
+$ beads --json stats
+{"total_issues":10,"open_issues":5,"closed_issues":3,"blocked_issues":1,"ready_issues":4}
+
+$ beads --json create "New task"
+{"id":"bd-xyz789","title":"New task","status":"open",...}</code></pre>
+    </section>
+
+    <section id="architecture">
+        <h2>Architecture</h2>
+
+        <h3>Core Types (<code>Beads/Core/</code>)</h3>
+        <ul>
+            <li><code>Types.lean</code> - Status, Priority, IssueType, DependencyType</li>
+            <li><code>Issue.lean</code> - Issue, Dependency, BlockedIssue structures</li>
+            <li><code>Id.lean</code> - Hash-based ID generation with collision resistance</li>
+            <li><code>Json.lean</code> - Serialization for all types</li>
+        </ul>
+
+        <h3>Storage (<code>Beads/Storage/</code>)</h3>
+        <ul>
+            <li><code>Storage.lean</code> - Abstract StorageOps interface</li>
+            <li><code>Jsonl.lean</code> - JSONL file-backed implementation with BFS cycle detection</li>
+        </ul>
+
+        <h3>CLI (<code>BeadsCLI/Main.lean</code>)</h3>
+        <p>Full command-line interface with argument parsing and JSON output support.</p>
+    </section>
+
+    <section id="examples">
+        <h2>Examples</h2>
+
+        <h3>Agent Workflow</h3>
+        <pre><code>#!/bin/bash
+# Agent picks up unassigned work
+READY=$(beads --json ready --unassigned --limit 1)
+ISSUE_ID=$(echo $READY | jq -r '.[0].id')
+
+# Claim and work on it
+beads update $ISSUE_ID --status in_progress --assignee agent
+
+# Complete the work
+beads close $ISSUE_ID "Implemented in PR #123"</code></pre>
+
+        <h3>Project Planning</h3>
+        <pre><code># Create epic
+beads create "User Authentication"   # bd-auth
+
+# Create and link child tasks
+beads create "Login page"            # bd-login
+beads dep add bd-login bd-auth --type parent-child
+
+beads create "OAuth integration"     # bd-oauth
+beads dep add bd-oauth bd-auth --type parent-child
+
+# Add blocking dependency
+beads dep add bd-oauth bd-login      # OAuth depends on login
+
+# View the structure
+beads dep tree bd-auth</code></pre>
+
+        <h3>CI Integration</h3>
+        <pre><code>#!/bin/bash
+# Check for blocking issues before deploy
+BLOCKED=$(beads --json blocked | jq length)
+if [ "$BLOCKED" -gt 0 ]; then
+  echo "Cannot deploy: $BLOCKED issues are blocked"
+  beads blocked
+  exit 1
+fi</code></pre>
+    </section>
+
+    <section>
+        <h2>Storage Format</h2>
+        <p>Issues are stored in <code>.beads/issues.jsonl</code>:</p>
+        <pre><code>{"id":"bd-a1b2c3","title":"Fix bug","status":"open","priority":2,...}
+{"id":"bd-d4e5f6","title":"Add feature","status":"closed",...}</code></pre>
+        <p>Dependencies are embedded in issue records for atomic operations.</p>
+    </section>
+
+    <footer style="margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--pico-muted-border-color); text-align: center;">
+        <p>
+            <a href="https://github.com/alok/beads-lean4">GitHub</a> |
+            MIT License |
+            Built with Lean 4
+        </p>
+    </footer>
+</main>
+</body>
+</html>
