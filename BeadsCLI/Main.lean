@@ -3,15 +3,23 @@ Beads CLI - Command line interface for the Beads issue tracker
 Agent-friendly with --json output on all commands
 -/
 import Beads
+import Beads.Storage.Sqlite.Storage
 import Lean.Data.Json
 
 open Beads
 open Lean Json
 
+/-- Storage backend type -/
+inductive StorageBackend where
+  | jsonl
+  | sqlite
+  deriving Inhabited, BEq
+
 /-- CLI configuration -/
 structure CLIConfig where
   jsonOutput : Bool := false
   beadsDir : System.FilePath := ".beads"
+  backend : StorageBackend := .jsonl
 
 /-- Parse command line flags and return remaining args -/
 def parseFlags (args : List String) : CLIConfig × List String :=
@@ -22,8 +30,26 @@ def parseFlags (args : List String) : CLIConfig × List String :=
     | "-j" :: rest => go { cfg with jsonOutput := true } remaining rest
     | "--dir" :: dir :: rest => go { cfg with beadsDir := dir } remaining rest
     | "-d" :: dir :: rest => go { cfg with beadsDir := dir } remaining rest
+    | "--sqlite" :: rest => go { cfg with backend := .sqlite } remaining rest
+    | "--jsonl" :: rest => go { cfg with backend := .jsonl } remaining rest
     | arg :: rest => go cfg (arg :: remaining) rest
   go {} [] args
+
+/-- Open storage based on backend selection -/
+def openStorage (cfg : CLIConfig) : IO StorageOps := do
+  match cfg.backend with
+  | .jsonl =>
+    let storage ← JsonlStorage.openOrCreate cfg.beadsDir
+    pure storage.toStorageOps
+  | .sqlite =>
+    let dbPath := cfg.beadsDir / "beads.db"
+    match ← SqliteStorage.openOrCreate dbPath with
+    | .ok storage => pure storage.toStorageOps
+    | .error e =>
+      IO.eprintln s!"Failed to open SQLite database: {e}"
+      -- Fallback to JSONL
+      let storage ← JsonlStorage.openOrCreate cfg.beadsDir
+      pure storage.toStorageOps
 
 /-- Output JSON or text based on config -/
 def outputResult (cfg : CLIConfig) (json : Json) (text : String) : IO Unit :=
@@ -64,8 +90,7 @@ def currentTimestamp : IO Nat := do
 def cmdCreate (cfg : CLIConfig) (args : List String) : IO UInt32 := do
   match args with
   | title :: rest =>
-    let storage ← JsonlStorage.openOrCreate cfg.beadsDir
-    let ops := storage.toStorageOps
+    let ops ← openStorage cfg
     let now ← currentTimestamp
 
     -- Parse optional description from remaining args
@@ -106,8 +131,7 @@ def cmdCreate (cfg : CLIConfig) (args : List String) : IO UInt32 := do
 
 /-- Command: list issues -/
 def cmdList (cfg : CLIConfig) (args : List String) : IO UInt32 := do
-  let storage ← JsonlStorage.openOrCreate cfg.beadsDir
-  let ops := storage.toStorageOps
+  let ops ← openStorage cfg
 
   -- Parse filter options
   let rec parseFilter (filter : IssueFilter) (args : List String) : IssueFilter :=
@@ -150,8 +174,7 @@ def cmdList (cfg : CLIConfig) (args : List String) : IO UInt32 := do
 def cmdShow (cfg : CLIConfig) (args : List String) : IO UInt32 := do
   match args.head? with
   | some idStr =>
-    let storage ← JsonlStorage.openOrCreate cfg.beadsDir
-    let ops := storage.toStorageOps
+    let ops ← openStorage cfg
 
     let issueId : IssueId := ⟨idStr⟩
     match ← ops.getIssue issueId with
@@ -192,8 +215,7 @@ def cmdShow (cfg : CLIConfig) (args : List String) : IO UInt32 := do
 
 /-- Command: show ready work (unblocked issues) -/
 def cmdReady (cfg : CLIConfig) (args : List String) : IO UInt32 := do
-  let storage ← JsonlStorage.openOrCreate cfg.beadsDir
-  let ops := storage.toStorageOps
+  let ops ← openStorage cfg
 
   let rec parseFilter (filter : WorkFilter) (args : List String) : WorkFilter :=
     match args with
@@ -225,8 +247,7 @@ def cmdReady (cfg : CLIConfig) (args : List String) : IO UInt32 := do
 def cmdDepAdd (cfg : CLIConfig) (args : List String) : IO UInt32 := do
   match args with
   | fromId :: toId :: rest =>
-    let storage ← JsonlStorage.openOrCreate cfg.beadsDir
-    let ops := storage.toStorageOps
+    let ops ← openStorage cfg
     let now ← currentTimestamp
 
     -- Parse optional dependency type
@@ -261,8 +282,7 @@ def cmdDepAdd (cfg : CLIConfig) (args : List String) : IO UInt32 := do
 def cmdUpdate (cfg : CLIConfig) (args : List String) : IO UInt32 := do
   match args.head? with
   | some idStr =>
-    let storage ← JsonlStorage.openOrCreate cfg.beadsDir
-    let ops := storage.toStorageOps
+    let ops ← openStorage cfg
     let now ← currentTimestamp
 
     let issueId : IssueId := ⟨idStr⟩
@@ -313,8 +333,7 @@ def cmdUpdate (cfg : CLIConfig) (args : List String) : IO UInt32 := do
 def cmdClose (cfg : CLIConfig) (args : List String) : IO UInt32 := do
   match args.head? with
   | some idStr =>
-    let storage ← JsonlStorage.openOrCreate cfg.beadsDir
-    let ops := storage.toStorageOps
+    let ops ← openStorage cfg
     let now ← currentTimestamp
 
     let issueId : IssueId := ⟨idStr⟩
@@ -359,8 +378,7 @@ def cmdClose (cfg : CLIConfig) (args : List String) : IO UInt32 := do
 def cmdLabelAdd (cfg : CLIConfig) (args : List String) : IO UInt32 := do
   match args with
   | issueIdStr :: label :: _ =>
-    let storage ← JsonlStorage.openOrCreate cfg.beadsDir
-    let ops := storage.toStorageOps
+    let ops ← openStorage cfg
 
     let issueId : IssueId := ⟨issueIdStr⟩
     match ← ops.getIssue issueId with
@@ -384,8 +402,7 @@ def cmdLabelAdd (cfg : CLIConfig) (args : List String) : IO UInt32 := do
 def cmdLabelRemove (cfg : CLIConfig) (args : List String) : IO UInt32 := do
   match args with
   | issueIdStr :: label :: _ =>
-    let storage ← JsonlStorage.openOrCreate cfg.beadsDir
-    let ops := storage.toStorageOps
+    let ops ← openStorage cfg
 
     let issueId : IssueId := ⟨issueIdStr⟩
     match ← ops.getIssue issueId with
@@ -409,8 +426,7 @@ def cmdLabelRemove (cfg : CLIConfig) (args : List String) : IO UInt32 := do
 def cmdLabelList (cfg : CLIConfig) (args : List String) : IO UInt32 := do
   match args.head? with
   | some issueIdStr =>
-    let storage ← JsonlStorage.openOrCreate cfg.beadsDir
-    let ops := storage.toStorageOps
+    let ops ← openStorage cfg
 
     let issueId : IssueId := ⟨issueIdStr⟩
     match ← ops.getIssue issueId with
@@ -435,8 +451,7 @@ def cmdLabelList (cfg : CLIConfig) (args : List String) : IO UInt32 := do
 
 /-- Command: show statistics -/
 def cmdStats (cfg : CLIConfig) (_args : List String) : IO UInt32 := do
-  let storage ← JsonlStorage.openOrCreate cfg.beadsDir
-  let ops := storage.toStorageOps
+  let ops ← openStorage cfg
 
   let allIssues ← ops.getAllIssues
   let blocked ← ops.getBlockedIssues
@@ -506,8 +521,7 @@ decreasing_by all_goals simp_all; omega
 def cmdDepTree (cfg : CLIConfig) (args : List String) : IO UInt32 := do
   match args.head? with
   | some issueIdStr =>
-    let storage ← JsonlStorage.openOrCreate cfg.beadsDir
-    let ops := storage.toStorageOps
+    let ops ← openStorage cfg
 
     let issueId : IssueId := ⟨issueIdStr⟩
     match ← ops.getIssue issueId with
@@ -543,8 +557,7 @@ def cmdDepTree (cfg : CLIConfig) (args : List String) : IO UInt32 := do
 
 /-- Command: show blocked issues -/
 def cmdBlocked (cfg : CLIConfig) (_args : List String) : IO UInt32 := do
-  let storage ← JsonlStorage.openOrCreate cfg.beadsDir
-  let ops := storage.toStorageOps
+  let ops ← openStorage cfg
 
   let blocked ← ops.getBlockedIssues
 
@@ -587,6 +600,8 @@ def printHelp : IO Unit := do
   IO.println "Flags:"
   IO.println "  --json, -j                     Output in JSON format"
   IO.println "  --dir, -d <path>               Use custom .beads directory"
+  IO.println "  --sqlite                       Use SQLite backend (default: JSONL)"
+  IO.println "  --jsonl                        Use JSONL backend (default)"
   IO.println ""
   IO.println "Update options:"
   IO.println "  --title <text>                 Set title"
