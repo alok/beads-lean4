@@ -1297,6 +1297,289 @@ def cmdConfigUnset (cfg : CLIConfig) (key : String) : IO UInt32 := do
     if !cfg.jsonOutput then IO.eprintln "No configuration file"
     pure 1
 
+/-- Get agent name from config or default -/
+def getAgentName (cfg : CLIConfig) : IO String := do
+  let configPath := cfg.beadsDir / "config.json"
+  if ← configPath.pathExists then
+    let content ← IO.FS.readFile configPath
+    match Json.parse content with
+    | .ok json =>
+      match json.getObjValD "agent_name" with
+      | .str name => return name
+      | _ => return "agent"
+    | _ => return "agent"
+  else
+    return "agent"
+
+/-- Command: send a message to another agent -/
+def cmdMessageSend (cfg : CLIConfig) (args : List String) : IO UInt32 := do
+  match args with
+  | toAgent :: subject :: bodyParts =>
+    let ops ← openStorage cfg
+    let fromAgent ← getAgentName cfg
+
+    -- Parse optional --issue flag
+    let (body, relatedIssue) := match bodyParts with
+      | "--issue" :: issueId :: rest => (" ".intercalate rest, some ⟨issueId⟩)
+      | _ =>
+        let fullBody := bodyParts.reverse
+        match fullBody with
+        | _ :: issueId :: "--issue" :: restRev =>
+          (" ".intercalate restRev.reverse, some ⟨issueId⟩)
+        | _ => (" ".intercalate bodyParts, none)
+
+    let msgId ← ops.sendMessage fromAgent toAgent subject body relatedIssue
+    ops.save
+
+    if cfg.jsonOutput then
+      IO.println (Json.mkObj [
+        ("id", Json.num msgId),
+        ("from", Json.str fromAgent),
+        ("to", Json.str toAgent),
+        ("subject", Json.str subject)
+      ]).compress
+    else
+      IO.println s!"Message #{msgId} sent to {toAgent}"
+    pure 0
+  | _ =>
+    IO.eprintln "Error: message send requires recipient and subject"
+    IO.eprintln "Usage: beads message send <to-agent> <subject> [body...] [--issue <id>]"
+    pure 1
+
+/-- Command: list inbox messages -/
+def cmdMessageInbox (cfg : CLIConfig) (args : List String) : IO UInt32 := do
+  let ops ← openStorage cfg
+
+  -- Get agent name from args or config
+  let agent ← match args.head? with
+    | some name => pure name
+    | none => getAgentName cfg
+
+  let messages ← ops.getInbox agent
+
+  if cfg.jsonOutput then
+    let json := Json.arr (messages.map toJson).toArray
+    IO.println json.compress
+  else
+    if messages.isEmpty then
+      IO.println s!"No messages for {agent}"
+    else
+      IO.println s!"Inbox for {agent} ({messages.length} messages):"
+      for msg in messages do
+        let readMark := if msg.isRead then "✓" else "○"
+        let ackedMark := if msg.isAcked then "[ACK]" else ""
+        let dateStr ← formatTimestamp msg.createdAt
+        IO.println s!"  {readMark} #{msg.id} from {msg.sender} ({dateStr}) {ackedMark}"
+        IO.println s!"    Subject: {msg.subject}"
+  pure 0
+
+/-- Command: read a specific message -/
+def cmdMessageRead (cfg : CLIConfig) (args : List String) : IO UInt32 := do
+  match args.head? with
+  | some idStr =>
+    let ops ← openStorage cfg
+    let id := idStr.toNat?.getD 0
+
+    match ← ops.getMessage id with
+    | some msg =>
+      -- Mark as read
+      ops.markRead id
+      ops.save
+
+      if cfg.jsonOutput then
+        IO.println (toJson msg).compress
+      else
+        let dateStr ← formatTimestamp msg.createdAt
+        IO.println s!"From: {msg.sender}"
+        IO.println s!"To: {msg.recipient}"
+        IO.println s!"Date: {dateStr}"
+        IO.println s!"Subject: {msg.subject}"
+        match msg.relatedIssue with
+        | some issueId => IO.println s!"Related Issue: {issueId.value}"
+        | none => pure ()
+        IO.println ""
+        IO.println msg.body
+      pure 0
+    | none =>
+      IO.eprintln s!"Error: Message not found: {idStr}"
+      pure 1
+  | none =>
+    IO.eprintln "Error: message read requires a message ID"
+    IO.eprintln "Usage: beads message read <id>"
+    pure 1
+
+/-- Command: acknowledge a message -/
+def cmdMessageAck (cfg : CLIConfig) (args : List String) : IO UInt32 := do
+  match args.head? with
+  | some idStr =>
+    let ops ← openStorage cfg
+    let id := idStr.toNat?.getD 0
+
+    match ← ops.getMessage id with
+    | some _ =>
+      ops.markAcked id
+      ops.save
+
+      if cfg.jsonOutput then
+        IO.println (Json.mkObj [("acked", Json.num id)]).compress
+      else
+        IO.println s!"Acknowledged message #{id}"
+      pure 0
+    | none =>
+      IO.eprintln s!"Error: Message not found: {idStr}"
+      pure 1
+  | none =>
+    IO.eprintln "Error: message ack requires a message ID"
+    IO.eprintln "Usage: beads message ack <id>"
+    pure 1
+
+/-- Command: edit an issue interactively -/
+def cmdEdit (cfg : CLIConfig) (args : List String) : IO UInt32 := do
+  match args.head? with
+  | some idStr =>
+    let ops ← openStorage cfg
+    let issueId : IssueId := ⟨idStr⟩
+
+    match ← ops.getIssue issueId with
+    | some issue =>
+      -- Create a temporary file with issue data
+      let tmpFile := s!"/tmp/beads-edit-{idStr}.md"
+
+      -- Write issue to temp file in editable format
+      let content := s!"# Issue: {issue.id.value}
+
+## Title
+{issue.title}
+
+## Status
+{issue.status.toString}
+
+## Priority (0-4)
+{issue.priority.val}
+
+## Type (task, bug, feature, epic)
+{issue.issueType.toString}
+
+## Assignee
+{issue.assignee.getD ""}
+
+## Description
+{issue.description}
+
+## Design
+{issue.design}
+
+## Acceptance Criteria
+{issue.acceptanceCriteria}
+
+## Notes
+{issue.notes}
+
+## Labels (comma-separated)
+{", ".intercalate issue.labels}
+"
+      IO.FS.writeFile tmpFile content
+
+      -- Get editor from environment or default
+      let editorResult ← IO.Process.output { cmd := "sh", args := #["-c", "echo ${EDITOR:-${VISUAL:-vi}}"] }
+      let editor := editorResult.stdout.trim
+
+      -- Open editor
+      let exitCode ← IO.Process.spawn {
+        cmd := editor
+        args := #[tmpFile]
+        stdin := .inherit
+        stdout := .inherit
+        stderr := .inherit
+      } >>= (·.wait)
+
+      if exitCode != 0 then
+        IO.eprintln s!"Editor exited with code {exitCode}"
+        pure 1
+      else
+        -- Read back the edited file
+        let edited ← IO.FS.readFile tmpFile
+
+        -- Parse the edited content (simple line-based parser)
+        let mut title := issue.title
+        let mut status := issue.status
+        let mut priority := issue.priority
+        let mut issueType := issue.issueType
+        let mut assignee := issue.assignee
+        let mut description := issue.description
+        let mut design := issue.design
+        let mut acceptanceCriteria := issue.acceptanceCriteria
+        let mut notes := issue.notes
+        let mut labels := issue.labels
+
+        let sections := edited.splitOn "## "
+        for sect in sections do
+          let lines := sect.splitOn "\n"
+          match lines.head? with
+          | some header =>
+            let content := "\n".intercalate (lines.drop 1) |>.trim
+            if header.startsWith "Title" then
+              title := content
+            else if header.startsWith "Status" then
+              status := Status.fromString? content |>.getD issue.status
+            else if header.startsWith "Priority" then
+              priority := content.toNat?.bind Priority.fromNat? |>.getD issue.priority
+            else if header.startsWith "Type" then
+              issueType := IssueType.fromString? content |>.getD issue.issueType
+            else if header.startsWith "Assignee" then
+              assignee := if content.isEmpty then none else some content
+            else if header.startsWith "Description" then
+              description := content
+            else if header.startsWith "Design" then
+              design := content
+            else if header.startsWith "Acceptance Criteria" then
+              acceptanceCriteria := content
+            else if header.startsWith "Notes" then
+              notes := content
+            else if header.startsWith "Labels" then
+              labels := content.splitOn "," |>.map String.trim |>.filter (!·.isEmpty)
+          | none => pure ()
+
+        let now ← currentTimestamp
+
+        -- Apply updates
+        ops.updateIssue issueId (fun _ => {
+          issue with
+          title := title
+          status := status
+          priority := priority
+          issueType := issueType
+          assignee := assignee
+          description := description
+          design := design
+          acceptanceCriteria := acceptanceCriteria
+          notes := notes
+          labels := labels
+          updatedAt := now
+        }) "cli"
+        ops.save
+
+        -- Clean up temp file
+        discard <| IO.Process.output { cmd := "rm", args := #["-f", tmpFile] }
+
+        match ← ops.getIssue issueId with
+        | some updated =>
+          if cfg.jsonOutput then
+            IO.println (toJson updated).compress
+          else
+            IO.println s!"Updated issue: {idStr}"
+          pure 0
+        | none =>
+          IO.eprintln "Error: Issue disappeared after edit"
+          pure 1
+    | none =>
+      IO.eprintln s!"Error: Issue not found: {idStr}"
+      pure 1
+  | none =>
+    IO.eprintln "Error: edit requires an issue ID"
+    IO.eprintln "Usage: beads edit <id>"
+    pure 1
+
 /-- Print help message -/
 def printHelp : IO Unit := do
   IO.println "beads - git-backed distributed issue tracker (Lean 4 port)"
@@ -1334,6 +1617,11 @@ def printHelp : IO Unit := do
   IO.println "  config get <key>               Get config value"
   IO.println "  config set <key> <value>       Set config value"
   IO.println "  config unset <key>             Remove config value"
+  IO.println "  message send <to> <subj> [body] Send message to agent"
+  IO.println "  message inbox [agent]          List inbox messages"
+  IO.println "  message read <id>              Read a message"
+  IO.println "  message ack <id>               Acknowledge a message"
+  IO.println "  edit <id>                      Edit an issue interactively"
   IO.println "  help                           Show this help"
   IO.println ""
   IO.println "Flags:"
@@ -1403,6 +1691,12 @@ def main (args : List String) : IO UInt32 := do
   | "config" :: "set" :: key :: value :: _ => cmdConfigSet cfg key value
   | "config" :: "unset" :: key :: _ => cmdConfigUnset cfg key
   | "config" :: _ => cmdConfigList cfg  -- Default to list
+  | "message" :: "send" :: rest => cmdMessageSend cfg rest
+  | "message" :: "inbox" :: rest => cmdMessageInbox cfg rest
+  | "message" :: "read" :: rest => cmdMessageRead cfg rest
+  | "message" :: "ack" :: rest => cmdMessageAck cfg rest
+  | "message" :: rest => cmdMessageInbox cfg rest  -- Default to inbox
+  | "edit" :: rest => cmdEdit cfg rest
   | cmd :: _ =>
     IO.eprintln s!"Unknown command: {cmd}"
     IO.eprintln "Run 'beads help' for usage"

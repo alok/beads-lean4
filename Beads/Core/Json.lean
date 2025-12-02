@@ -209,4 +209,33 @@ instance : ToJson Statistics where
     ("epics_eligible_for_closure", .num s.epicsEligibleForClosure)
   ]
 
+-- Message JSON (for inter-agent communication)
+instance : ToJson Message where
+  toJson m := .mkObj [
+    ("id", .num m.id),
+    ("from", .str m.sender),
+    ("to", .str m.recipient),
+    ("subject", .str m.subject),
+    ("body", .str m.body),
+    ("created_at", .num m.createdAt),
+    ("read_at", match m.readAt with | some t => .num t | none => .null),
+    ("acked_at", match m.ackedAt with | some t => .num t | none => .null),
+    ("related_issue", match m.relatedIssue with | some id => toJson id | none => .null)
+  ]
+
+instance : FromJson Message where
+  fromJson? j := do
+    let id ← j.getObjValAs? Nat "id"
+    let sender ← j.getObjValAs? String "from"
+    let recipient ← j.getObjValAs? String "to"
+    let subject ← j.getObjValAs? String "subject"
+    let body ← j.getObjValAs? String "body"
+    let createdAt ← j.getObjValAs? Nat "created_at"
+    let readAt := getOptNat j "read_at"
+    let ackedAt := getOptNat j "acked_at"
+    let relatedIssue : Option IssueId := match j.getObjValAs? String "related_issue" with
+      | .ok s => some ⟨s⟩
+      | .error _ => none
+    pure { id, sender, recipient, subject, body, createdAt, readAt, ackedAt, relatedIssue }
+
 end Beads

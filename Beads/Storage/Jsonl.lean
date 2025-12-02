@@ -22,6 +22,10 @@ structure JsonlStorage where
   comments : IO.Ref (List Comment)
   /-- Next comment ID -/
   nextCommentId : IO.Ref Nat
+  /-- In-memory messages store -/
+  messages : IO.Ref (List Message)
+  /-- Next message ID -/
+  nextMessageId : IO.Ref Nat
   /-- ID generator state -/
   idGenState : IO.Ref IdGenerator.State
   /-- Dirty flag for save optimization -/
@@ -41,6 +45,10 @@ def deletionsPath (storage : JsonlStorage) : System.FilePath :=
 def commentsPath (storage : JsonlStorage) : System.FilePath :=
   storage.beadsDir / "comments.jsonl"
 
+/-- Path to messages.jsonl -/
+def messagesPath (storage : JsonlStorage) : System.FilePath :=
+  storage.beadsDir / "messages.jsonl"
+
 /-- Create a new JSONL storage at the given path -/
 def create (beadsDir : System.FilePath) : IO JsonlStorage := do
   -- Create .beads directory if it doesn't exist
@@ -49,9 +57,11 @@ def create (beadsDir : System.FilePath) : IO JsonlStorage := do
   let dependencies ← IO.mkRef []
   let comments ← IO.mkRef []
   let nextCommentId ← IO.mkRef 1
+  let messages ← IO.mkRef []
+  let nextMessageId ← IO.mkRef 1
   let idGenState ← IO.mkRef {}
   let dirty ← IO.mkRef false
-  pure { beadsDir, issues, dependencies, comments, nextCommentId, idGenState, dirty }
+  pure { beadsDir, issues, dependencies, comments, nextCommentId, messages, nextMessageId, idGenState, dirty }
 
 /-- Parse a JSONL file into a list of JSON values -/
 def parseJsonl (content : String) : List (Except String Json) :=
@@ -80,6 +90,29 @@ def loadComments (storage : JsonlStorage) : IO Unit := do
 
     storage.comments.set comments
     storage.nextCommentId.set (maxId + 1)
+  pure ()
+
+/-- Load messages from JSONL file -/
+def loadMessages (storage : JsonlStorage) : IO Unit := do
+  let path := storage.messagesPath
+  if ← path.pathExists then
+    let content ← IO.FS.readFile path
+    let lines := parseJsonl content
+    let mut messages : List Message := []
+    let mut maxId : Nat := 0
+
+    for lineResult in lines do
+      match lineResult with
+      | .ok json =>
+        match fromJson? json with
+        | .ok (msg : Message) =>
+          messages := msg :: messages
+          if msg.id > maxId then maxId := msg.id
+        | .error _ => pure ()
+      | .error _ => pure ()
+
+    storage.messages.set messages
+    storage.nextMessageId.set (maxId + 1)
   pure ()
 
 /-- Load issues from JSONL file -/
@@ -117,8 +150,9 @@ def loadIssues (storage : JsonlStorage) : IO Unit := do
     storage.dependencies.set deps
     storage.idGenState.modify fun s => { s with existingIds }
 
-  -- Also load comments
+  -- Also load comments and messages
   loadComments storage
+  loadMessages storage
 
 /-- Helper: lookup with default in HashMap -/
 def hashMapFindD {α β : Type} [BEq α] [Hashable α] (m : Std.HashMap α β) (k : α) (d : β) : β :=
@@ -138,6 +172,17 @@ def saveComments (storage : JsonlStorage) : IO Unit := do
     let lines := comments.map fun c => (toJson c).compress
     let content := "\n".intercalate lines.reverse
     IO.FS.writeFile (storage.commentsPath) (content ++ "\n")
+
+/-- Save messages to JSONL file -/
+def saveMessages (storage : JsonlStorage) : IO Unit := do
+  let messages ← storage.messages.get
+  if messages.isEmpty then
+    -- Don't write empty file
+    pure ()
+  else
+    let lines := messages.map fun m => (toJson m).compress
+    let content := "\n".intercalate lines.reverse
+    IO.FS.writeFile (storage.messagesPath) (content ++ "\n")
 
 /-- Save issues to JSONL file -/
 def saveIssues (storage : JsonlStorage) : IO Unit := do
@@ -168,8 +213,9 @@ def saveIssues (storage : JsonlStorage) : IO Unit := do
   let content := "\n".intercalate lines.reverse
   IO.FS.writeFile (storage.issuesPath) (content ++ "\n")
 
-  -- Also save comments
+  -- Also save comments and messages
   saveComments storage
+  saveMessages storage
   storage.dirty.set false
 
 /-- Check if adding a dependency would create a cycle (BFS from target to source) -/
@@ -319,6 +365,50 @@ def toStorageOps (storage : JsonlStorage) : StorageOps := {
     pure (comments.filter (·.issueId == issueId) |>.reverse)
 
   getAllComments := storage.comments.get
+
+  sendMessage := fun sender recipient subject body relatedIssue => do
+    let id ← storage.nextMessageId.get
+    storage.nextMessageId.set (id + 1)
+    let now ← IO.Process.output { cmd := "date", args := #["+%s"] }
+    let timestamp := now.stdout.trim.toNat?.getD 0
+    let msg : Message := {
+      id := id
+      sender := sender
+      recipient := recipient
+      subject := subject
+      body := body
+      createdAt := timestamp
+      readAt := none
+      ackedAt := none
+      relatedIssue := relatedIssue
+    }
+    storage.messages.modify fun ms => msg :: ms
+    storage.dirty.set true
+    pure id
+
+  getInbox := fun recipient => do
+    let messages ← storage.messages.get
+    pure (messages.filter (·.recipient == recipient) |>.reverse)
+
+  getMessage := fun id => do
+    let messages ← storage.messages.get
+    pure (messages.find? (·.id == id))
+
+  markRead := fun id => do
+    let now ← IO.Process.output { cmd := "date", args := #["+%s"] }
+    let timestamp := now.stdout.trim.toNat?.getD 0
+    storage.messages.modify fun ms =>
+      ms.map fun m => if m.id == id then { m with readAt := some timestamp } else m
+    storage.dirty.set true
+
+  markAcked := fun id => do
+    let now ← IO.Process.output { cmd := "date", args := #["+%s"] }
+    let timestamp := now.stdout.trim.toNat?.getD 0
+    storage.messages.modify fun ms =>
+      ms.map fun m => if m.id == id then { m with ackedAt := some timestamp } else m
+    storage.dirty.set true
+
+  getAllMessages := storage.messages.get
 
   getReadyWork := fun filter => do
     let issues ← storage.issues.get

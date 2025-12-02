@@ -185,6 +185,29 @@ structure Comment where
   createdAt : Timestamp
   deriving Repr, Inhabited
 
+/-- Message for inter-agent communication -/
+structure Message where
+  id : Nat
+  sender : String     -- Sender agent name (can't use 'from' - reserved)
+  recipient : String  -- Recipient agent name (can't use 'to' - reserved)
+  subject : String    -- Brief subject/topic
+  body : String       -- Full message content
+  createdAt : Timestamp
+  readAt : Option Timestamp := none
+  ackedAt : Option Timestamp := none
+  relatedIssue : Option IssueId := none  -- Optional related issue
+  deriving Repr, Inhabited
+
+namespace Message
+
+/-- Check if message has been read -/
+def isRead (msg : Message) : Bool := msg.readAt.isSome
+
+/-- Check if message has been acknowledged -/
+def isAcked (msg : Message) : Bool := msg.ackedAt.isSome
+
+end Message
+
 /-- Event for audit trail -/
 structure Event where
   id : Nat

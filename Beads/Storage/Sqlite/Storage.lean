@@ -62,7 +62,19 @@ private def createSchemaSQL : List String := [
     text TEXT NOT NULL,
     created_at INTEGER NOT NULL
   )",
+  "CREATE TABLE IF NOT EXISTS messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    from_agent TEXT NOT NULL,
+    to_agent TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    body TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    read_at INTEGER,
+    acked_at INTEGER,
+    related_issue TEXT REFERENCES issues(id) ON DELETE SET NULL
+  )",
   "CREATE INDEX IF NOT EXISTS idx_comments_issue_id ON comments(issue_id)",
+  "CREATE INDEX IF NOT EXISTS idx_messages_to ON messages(to_agent)",
   "CREATE INDEX IF NOT EXISTS idx_issues_status ON issues(status)",
   "CREATE INDEX IF NOT EXISTS idx_issues_priority ON issues(priority)",
   "CREATE INDEX IF NOT EXISTS idx_dependencies_issue_id ON dependencies(issue_id)",
@@ -404,6 +416,110 @@ def toStorageOps (storage : SqliteStorage) : StorageOps := {
           running := false
       finalize stmt
       return comments.reverse
+
+  sendMessage := fun sender recipient subject body relatedIssue => do
+    let now ← IO.Process.output { cmd := "date", args := #["+%s"] }
+    let timestamp := now.stdout.trim.toNat?.getD 0
+    let relatedIssueVal := match relatedIssue with | some id => s!"'{id.value}'" | none => "NULL"
+    let sql := s!"INSERT INTO messages (from_agent, to_agent, subject, body, created_at, related_issue) VALUES ('{sender}', '{recipient}', '{subject.replace "'" "''"}', '{body.replace "'" "''"}', {timestamp}, {relatedIssueVal}) RETURNING id"
+    match ← prepare storage.db sql with
+    | .error _ => return 0
+    | .ok stmt =>
+      let rc ← step stmt
+      if rc == SQLITE_ROW then
+        let id ← columnInt stmt 0
+        finalize stmt
+        return id.toNat
+      else
+        finalize stmt
+        return 0
+
+  getInbox := fun recipientArg => do
+    let sql := s!"SELECT id, from_agent, to_agent, subject, body, created_at, read_at, acked_at, related_issue FROM messages WHERE to_agent = '{recipientArg}' ORDER BY created_at DESC"
+    match ← prepare storage.db sql with
+    | .error _ => return []
+    | .ok stmt =>
+      let mut messages : List Message := []
+      let mut running := true
+      while running do
+        let rc ← step stmt
+        if rc == SQLITE_ROW then
+          let id := (← columnInt stmt 0).toNat
+          let sender ← columnText stmt 1
+          let recipient ← columnText stmt 2
+          let subject ← columnText stmt 3
+          let body ← columnText stmt 4
+          let createdAt := (← columnInt stmt 5).toNat
+          let readAt := let v := (← columnInt stmt 6).toNat; if v == 0 then none else some v
+          let ackedAt := let v := (← columnInt stmt 7).toNat; if v == 0 then none else some v
+          let relatedIssueStr ← columnText stmt 8
+          let relatedIssue := if relatedIssueStr.isEmpty then none else some ⟨relatedIssueStr⟩
+          messages := { id, sender, recipient, subject, body, createdAt, readAt, ackedAt, relatedIssue } :: messages
+        else
+          running := false
+      finalize stmt
+      return messages.reverse
+
+  getMessage := fun id => do
+    let sql := s!"SELECT id, from_agent, to_agent, subject, body, created_at, read_at, acked_at, related_issue FROM messages WHERE id = {id}"
+    match ← prepare storage.db sql with
+    | .error _ => return none
+    | .ok stmt =>
+      let rc ← step stmt
+      if rc == SQLITE_ROW then
+        let msgId := (← columnInt stmt 0).toNat
+        let sender ← columnText stmt 1
+        let recipient ← columnText stmt 2
+        let subject ← columnText stmt 3
+        let body ← columnText stmt 4
+        let createdAt := (← columnInt stmt 5).toNat
+        let readAt := let v := (← columnInt stmt 6).toNat; if v == 0 then none else some v
+        let ackedAt := let v := (← columnInt stmt 7).toNat; if v == 0 then none else some v
+        let relatedIssueStr ← columnText stmt 8
+        let relatedIssue := if relatedIssueStr.isEmpty then none else some ⟨relatedIssueStr⟩
+        finalize stmt
+        return some { id := msgId, sender, recipient, subject, body, createdAt, readAt, ackedAt, relatedIssue }
+      else
+        finalize stmt
+        return none
+
+  markRead := fun id => do
+    let now ← IO.Process.output { cmd := "date", args := #["+%s"] }
+    let timestamp := now.stdout.trim.toNat?.getD 0
+    let sql := s!"UPDATE messages SET read_at = {timestamp} WHERE id = {id}"
+    discard <| exec storage.db sql
+
+  markAcked := fun id => do
+    let now ← IO.Process.output { cmd := "date", args := #["+%s"] }
+    let timestamp := now.stdout.trim.toNat?.getD 0
+    let sql := s!"UPDATE messages SET acked_at = {timestamp} WHERE id = {id}"
+    discard <| exec storage.db sql
+
+  getAllMessages := do
+    let sql := "SELECT id, from_agent, to_agent, subject, body, created_at, read_at, acked_at, related_issue FROM messages ORDER BY created_at DESC"
+    match ← prepare storage.db sql with
+    | .error _ => return []
+    | .ok stmt =>
+      let mut messages : List Message := []
+      let mut running := true
+      while running do
+        let rc ← step stmt
+        if rc == SQLITE_ROW then
+          let id := (← columnInt stmt 0).toNat
+          let sender ← columnText stmt 1
+          let recipient ← columnText stmt 2
+          let subject ← columnText stmt 3
+          let body ← columnText stmt 4
+          let createdAt := (← columnInt stmt 5).toNat
+          let readAt := let v := (← columnInt stmt 6).toNat; if v == 0 then none else some v
+          let ackedAt := let v := (← columnInt stmt 7).toNat; if v == 0 then none else some v
+          let relatedIssueStr ← columnText stmt 8
+          let relatedIssue := if relatedIssueStr.isEmpty then none else some ⟨relatedIssueStr⟩
+          messages := { id, sender, recipient, subject, body, createdAt, readAt, ackedAt, relatedIssue } :: messages
+        else
+          running := false
+      finalize stmt
+      return messages.reverse
 
   getReadyWork := fun filter => do
     -- Get blocked issue IDs

@@ -43,6 +43,14 @@ structure StorageOps where
   getComments : IssueId → IO (List Comment)
   getAllComments : IO (List Comment)
 
+  -- Message operations (inter-agent communication)
+  sendMessage : String → String → String → String → Option IssueId → IO Nat  -- from, to, subject, body, relatedIssue → message ID
+  getInbox : String → IO (List Message)  -- Get messages for recipient
+  getMessage : Nat → IO (Option Message)  -- Get message by ID
+  markRead : Nat → IO Unit  -- Mark message as read
+  markAcked : Nat → IO Unit  -- Mark message as acknowledged
+  getAllMessages : IO (List Message)
+
   -- Ready work operations
   getReadyWork : WorkFilter → IO (List Issue)
   getBlockedIssues : IO (List BlockedIssue)
