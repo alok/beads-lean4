@@ -947,6 +947,125 @@ def cmdImport (cfg : CLIConfig) (args : List String) : IO UInt32 := do
     IO.eprintln "Usage: beads import <file.json>"
     pure 1
 
+/-- Command: count issues -/
+def cmdCount (cfg : CLIConfig) (args : List String) : IO UInt32 := do
+  let ops ← openStorage cfg
+
+  -- Parse filter options (same as list)
+  let rec parseFilter (filter : IssueFilter) (args : List String) : IssueFilter :=
+    match args with
+    | [] => filter
+    | "--status" :: s :: rest =>
+      parseFilter { filter with status := Status.fromString? s } rest
+    | "--priority" :: p :: rest =>
+      let priority := match p.toNat? with
+        | some n => Priority.fromNat? n
+        | none => none
+      parseFilter { filter with priority } rest
+    | "--type" :: t :: rest =>
+      parseFilter { filter with issueType := IssueType.fromString? t } rest
+    | "--assignee" :: a :: rest =>
+      parseFilter { filter with assignee := some a } rest
+    | _ :: rest => parseFilter filter rest
+
+  let filter := { parseFilter IssueFilter.default args with limit := 100000 }  -- No limit for count
+  let issues ← ops.searchIssues filter
+  let count := issues.length
+
+  if cfg.jsonOutput then
+    IO.println (Json.mkObj [("count", Json.num count)]).compress
+  else
+    IO.println s!"{count}"
+  pure 0
+
+/-- Command: validate data integrity -/
+def cmdValidate (cfg : CLIConfig) (_args : List String) : IO UInt32 := do
+  let ops ← openStorage cfg
+
+  let mut errors : List String := []
+  let mut warnings : List String := []
+
+  let allIssues ← ops.getAllIssues
+  let allDeps ← ops.getAllDependencies
+  let issueIds : Std.HashSet IssueId := allIssues.foldl (fun s i => s.insert i.id) {}
+
+  -- Check 1: Dependencies point to existing issues
+  for dep in allDeps do
+    if !issueIds.contains dep.issueId then
+      errors := s!"Dependency from {dep.issueId.value} references non-existent issue" :: errors
+    if !issueIds.contains dep.dependsOnId then
+      errors := s!"Dependency to {dep.dependsOnId.value} references non-existent issue" :: errors
+
+  -- Check 2: Detect cycles in dependency graph
+  let cycles ← ops.detectCycles
+  for cycle in cycles do
+    let cycleStr := " → ".intercalate (cycle.map (·.value))
+    errors := s!"Cycle detected: {cycleStr}" :: errors
+
+  -- Check 3: Closed issues should have closedAt timestamp
+  for issue in allIssues do
+    if issue.status == .closed && issue.closedAt.isNone then
+      warnings := s!"Issue {issue.id.value} is closed but has no closedAt timestamp" :: warnings
+
+  -- Check 4: Non-closed issues shouldn't have closedAt
+  for issue in allIssues do
+    if issue.status != .closed && issue.closedAt.isSome then
+      warnings := s!"Issue {issue.id.value} is {issue.status.toString} but has closedAt timestamp" :: warnings
+
+  -- Check 5: Self-referential dependencies
+  for dep in allDeps do
+    if dep.issueId == dep.dependsOnId then
+      errors := s!"Self-referential dependency: {dep.issueId.value}" :: errors
+
+  let valid := errors.isEmpty
+
+  if cfg.jsonOutput then
+    IO.println (Json.mkObj [
+      ("valid", Json.bool valid),
+      ("errors", Json.arr (errors.map Json.str).toArray),
+      ("warnings", Json.arr (warnings.map Json.str).toArray),
+      ("issueCount", Json.num allIssues.length),
+      ("dependencyCount", Json.num allDeps.length)
+    ]).compress
+  else
+    IO.println s!"Issues: {allIssues.length}"
+    IO.println s!"Dependencies: {allDeps.length}"
+    if errors.isEmpty && warnings.isEmpty then
+      IO.println "✓ No issues found"
+    else
+      if !errors.isEmpty then
+        IO.println s!"\nErrors ({errors.length}):"
+        for err in errors do
+          IO.println s!"  ✗ {err}"
+      if !warnings.isEmpty then
+        IO.println s!"\nWarnings ({warnings.length}):"
+        for warn in warnings do
+          IO.println s!"  ⚠ {warn}"
+
+  pure (if valid then 0 else 1)
+
+/-- Command: show dependency cycles -/
+def cmdDepCycles (cfg : CLIConfig) (_args : List String) : IO UInt32 := do
+  let ops ← openStorage cfg
+
+  let cycles ← ops.detectCycles
+
+  if cfg.jsonOutput then
+    let json := Json.arr (cycles.map fun cycle =>
+      Json.arr (cycle.map fun id => Json.str id.value).toArray
+    ).toArray
+    IO.println json.compress
+  else
+    if cycles.isEmpty then
+      IO.println "No dependency cycles found"
+    else
+      IO.println s!"Found {cycles.length} cycle(s):"
+      for cycle in cycles do
+        let cycleStr := " → ".intercalate (cycle.map (·.value))
+        IO.println s!"  {cycleStr}"
+
+  pure (if cycles.isEmpty then 0 else 1)
+
 /-- Command: show blocked issues -/
 def cmdBlocked (cfg : CLIConfig) (_args : List String) : IO UInt32 := do
   let ops ← openStorage cfg
@@ -988,12 +1107,15 @@ def printHelp : IO Unit := do
   IO.println "  dep add <from> <to> [--type]   Add dependency"
   IO.println "  dep remove <from> <to>         Remove dependency"
   IO.println "  dep tree <id> [--mermaid]      Show dependency tree"
+  IO.println "  dep cycles                     Find dependency cycles"
   IO.println "  ready [filters]                Show ready (unblocked) work"
   IO.println "  blocked                        Show blocked issues"
   IO.println "  stats                          Show issue statistics"
   IO.println "  export [file]                  Export all data to JSON"
   IO.println "  import <file>                  Import data from JSON export"
   IO.println "  delete <id> [--force]          Delete an issue"
+  IO.println "  count [filters]                Count issues (returns just number)"
+  IO.println "  validate                       Check data integrity"
   IO.println "  help                           Show this help"
   IO.println ""
   IO.println "Flags:"
@@ -1045,9 +1167,12 @@ def main (args : List String) : IO UInt32 := do
   | "dep" :: "add" :: rest => cmdDepAdd cfg rest
   | "dep" :: "remove" :: rest => cmdDepRemove cfg rest
   | "dep" :: "tree" :: rest => cmdDepTree cfg rest
+  | "dep" :: "cycles" :: rest => cmdDepCycles cfg rest
   | "export" :: rest => cmdExport cfg rest
   | "import" :: rest => cmdImport cfg rest
   | "delete" :: rest => cmdDelete cfg rest
+  | "count" :: rest => cmdCount cfg rest
+  | "validate" :: rest => cmdValidate cfg rest
   | "ready" :: rest => cmdReady cfg rest
   | "blocked" :: rest => cmdBlocked cfg rest
   | "stats" :: rest => cmdStats cfg rest
