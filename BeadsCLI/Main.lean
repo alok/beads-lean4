@@ -850,6 +850,7 @@ def cmdExport (cfg : CLIConfig) (args : List String) : IO UInt32 := do
 
   let issues ← ops.getAllIssues
   let deps ← ops.getAllDependencies
+  let comments ← ops.getAllComments
 
   -- Collect all labels
   let mut allLabels : List (IssueId × List String) := []
@@ -859,13 +860,14 @@ def cmdExport (cfg : CLIConfig) (args : List String) : IO UInt32 := do
       allLabels := (issue.id, labels) :: allLabels
 
   let exportJson := Json.mkObj [
-    ("version", Json.str "1.0"),
+    ("version", Json.str "1.1"),
     ("exportedAt", Json.num (← currentTimestamp)),
     ("issues", Json.arr (issues.map toJson).toArray),
     ("dependencies", Json.arr (deps.map toJson).toArray),
     ("labels", Json.arr (allLabels.map fun (id, labels) =>
       Json.mkObj [("issueId", toJson id), ("labels", Json.arr (labels.map Json.str).toArray)]
-    ).toArray)
+    ).toArray),
+    ("comments", Json.arr (comments.map toJson).toArray)
   ]
 
   match args.head? with
@@ -997,13 +999,28 @@ def cmdImport (cfg : CLIConfig) (args : List String) : IO UInt32 := do
           | _, _ => pure ()
       | _ => pure ()
 
+      -- Import comments
+      let commentsJson := json.getObjValD "comments"
+      let mut importedComments := 0
+      match commentsJson with
+      | .arr comments =>
+        for commentJson in comments do
+          match fromJson? commentJson with
+          | .ok (comment : Comment) =>
+            -- Add the comment (new ID will be assigned)
+            let _ ← ops.addComment comment.issueId comment.text comment.author
+            importedComments := importedComments + 1
+          | .error _ => pure ()
+      | _ => pure ()
+
       ops.save
 
-      let text := s!"Imported {importedIssues} issues, {importedDeps} dependencies (skipped {skippedIssues} existing, {cycleErrors} cycle errors)"
+      let text := s!"Imported {importedIssues} issues, {importedDeps} deps, {importedComments} comments (skipped {skippedIssues} existing, {cycleErrors} cycle errors)"
       if cfg.jsonOutput then
         IO.println (Json.mkObj [
           ("importedIssues", Json.num importedIssues),
           ("importedDeps", Json.num importedDeps),
+          ("importedComments", Json.num importedComments),
           ("skippedIssues", Json.num skippedIssues),
           ("cycleErrors", Json.num cycleErrors)
         ]).compress
