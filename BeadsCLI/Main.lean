@@ -86,6 +86,19 @@ def currentTimestamp : IO Nat := do
   | some n => pure n
   | none => pure 0  -- Fallback if date command fails
 
+/-- Parse create options from args -/
+def parseCreateOpts (args : List String) : (Option IssueType × Option Priority × List String) :=
+  let rec go (issueType : Option IssueType) (priority : Option Priority) (desc : List String) (remaining : List String) :=
+    match remaining with
+    | "--type" :: t :: rest =>
+      go (IssueType.fromString? t) priority desc rest
+    | "--priority" :: p :: rest =>
+      go issueType (p.toNat?.bind Priority.fromNat?) desc rest
+    | other :: rest =>
+      go issueType priority (desc ++ [other]) rest
+    | [] => (issueType, priority, desc)
+  go none none [] args
+
 /-- Command: create a new issue -/
 def cmdCreate (cfg : CLIConfig) (args : List String) : IO UInt32 := do
   match args with
@@ -93,8 +106,9 @@ def cmdCreate (cfg : CLIConfig) (args : List String) : IO UInt32 := do
     let ops ← openStorage cfg
     let now ← currentTimestamp
 
-    -- Parse optional description from remaining args
-    let description := if rest.isEmpty then "" else " ".intercalate rest
+    -- Parse optional flags and description from remaining args
+    let (issueTypeOpt, priorityOpt, descParts) := parseCreateOpts rest
+    let description := if descParts.isEmpty then "" else " ".intercalate descParts
 
     let issue : Issue := {
       id := ⟨""⟩  -- Will be generated
@@ -104,8 +118,8 @@ def cmdCreate (cfg : CLIConfig) (args : List String) : IO UInt32 := do
       acceptanceCriteria := ""
       notes := ""
       status := .open
-      priority := Priority.default
-      issueType := .task
+      priority := priorityOpt.getD Priority.default
+      issueType := issueTypeOpt.getD .task
       assignee := none
       estimatedMinutes := none
       createdAt := now
@@ -126,7 +140,7 @@ def cmdCreate (cfg : CLIConfig) (args : List String) : IO UInt32 := do
     pure 0
   | [] =>
     IO.eprintln "Error: create requires a title"
-    IO.eprintln "Usage: beads create <title> [description...]"
+    IO.eprintln "Usage: beads create <title> [--type <type>] [--priority <0-4>] [description...]"
     pure 1
 
 /-- Command: list issues -/
@@ -454,6 +468,7 @@ def cmdStats (cfg : CLIConfig) (_args : List String) : IO UInt32 := do
   let ops ← openStorage cfg
 
   let allIssues ← ops.getAllIssues
+  let allDeps ← ops.getAllDependencies
   let blocked ← ops.getBlockedIssues
   let ready ← ops.getReadyWork WorkFilter.default
 
@@ -464,6 +479,21 @@ def cmdStats (cfg : CLIConfig) (_args : List String) : IO UInt32 := do
   let blockedCount := blocked.length
   let readyCount := ready.length
 
+  -- Compute epics eligible for closure
+  -- An epic is eligible if: it's type epic, not closed, and all children are closed
+  let issueMap : Std.HashMap IssueId Issue := allIssues.foldl (fun m i => m.insert i.id i) {}
+  let epicsNotClosed := allIssues.filter fun i => i.issueType == .epic && i.status != .closed
+  let parentChildDeps := allDeps.filter (·.depType == .parentChild)
+
+  let epicsEligible := epicsNotClosed.filter fun epic =>
+    -- Find all children of this epic (children have dep pointing to epic as parent)
+    let children := parentChildDeps.filter (·.dependsOnId == epic.id) |>.map (·.issueId)
+    -- Epic is eligible if it has children and all are closed
+    !children.isEmpty && children.all fun childId =>
+      match issueMap.get? childId with
+      | some child => child.status == .closed
+      | none => true  -- Missing child (deleted) is considered ok
+
   let stats : Statistics := {
     totalIssues := total
     openIssues := openCount
@@ -471,7 +501,7 @@ def cmdStats (cfg : CLIConfig) (_args : List String) : IO UInt32 := do
     closedIssues := closedCount
     blockedIssues := blockedCount
     readyIssues := readyCount
-    epicsEligibleForClosure := 0  -- TODO: implement
+    epicsEligibleForClosure := epicsEligible.length
   }
 
   if cfg.jsonOutput then
@@ -483,6 +513,8 @@ def cmdStats (cfg : CLIConfig) (_args : List String) : IO UInt32 := do
     IO.println s!"Closed:      {closedCount}"
     IO.println s!"Blocked:     {blockedCount}"
     IO.println s!"Ready:       {readyCount}"
+    if epicsEligible.length > 0 then
+      IO.println s!"Epics ready to close: {epicsEligible.length}"
   pure 0
 
 /-- Helper for dependency tree collection -/
