@@ -55,6 +55,14 @@ private def createSchemaSQL : List String := [
     label TEXT NOT NULL,
     PRIMARY KEY (issue_id, label)
   )",
+  "CREATE TABLE IF NOT EXISTS comments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    issue_id TEXT NOT NULL REFERENCES issues(id) ON DELETE CASCADE,
+    author TEXT NOT NULL,
+    text TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+  )",
+  "CREATE INDEX IF NOT EXISTS idx_comments_issue_id ON comments(issue_id)",
   "CREATE INDEX IF NOT EXISTS idx_issues_status ON issues(status)",
   "CREATE INDEX IF NOT EXISTS idx_issues_priority ON issues(priority)",
   "CREATE INDEX IF NOT EXISTS idx_dependencies_issue_id ON dependencies(issue_id)",
@@ -338,6 +346,64 @@ def toStorageOps (storage : SqliteStorage) : StorageOps := {
     | _ => return ()
 
   getLabels := fun issueId => loadLabels storage.db issueId
+
+  addComment := fun issueId text author => do
+    let now ← IO.Process.output { cmd := "date", args := #["+%s"] }
+    let timestamp := now.stdout.trim.toNat?.getD 0
+    let sql := s!"INSERT INTO comments (issue_id, author, text, created_at) VALUES ('{issueId.value}', '{author}', '{text.replace "'" "''"}', {timestamp}) RETURNING id"
+    match ← prepare storage.db sql with
+    | .error _ => return 0
+    | .ok stmt =>
+      let rc ← step stmt
+      if rc == SQLITE_ROW then
+        let id ← columnInt stmt 0
+        finalize stmt
+        return id.toNat
+      else
+        finalize stmt
+        return 0
+
+  getComments := fun issueId => do
+    let sql := s!"SELECT id, issue_id, author, text, created_at FROM comments WHERE issue_id = '{issueId.value}' ORDER BY created_at ASC"
+    match ← prepare storage.db sql with
+    | .error _ => return []
+    | .ok stmt =>
+      let mut comments : List Comment := []
+      let mut running := true
+      while running do
+        let rc ← step stmt
+        if rc == SQLITE_ROW then
+          let id := (← columnInt stmt 0).toNat
+          let issueIdVal ← columnText stmt 1
+          let author ← columnText stmt 2
+          let text ← columnText stmt 3
+          let createdAt := (← columnInt stmt 4).toNat
+          comments := { id, issueId := ⟨issueIdVal⟩, author, text, createdAt } :: comments
+        else
+          running := false
+      finalize stmt
+      return comments.reverse
+
+  getAllComments := do
+    let sql := "SELECT id, issue_id, author, text, created_at FROM comments ORDER BY created_at ASC"
+    match ← prepare storage.db sql with
+    | .error _ => return []
+    | .ok stmt =>
+      let mut comments : List Comment := []
+      let mut running := true
+      while running do
+        let rc ← step stmt
+        if rc == SQLITE_ROW then
+          let id := (← columnInt stmt 0).toNat
+          let issueIdVal ← columnText stmt 1
+          let author ← columnText stmt 2
+          let text ← columnText stmt 3
+          let createdAt := (← columnInt stmt 4).toNat
+          comments := { id, issueId := ⟨issueIdVal⟩, author, text, createdAt } :: comments
+        else
+          running := false
+      finalize stmt
+      return comments.reverse
 
   getReadyWork := fun filter => do
     -- Get blocked issue IDs

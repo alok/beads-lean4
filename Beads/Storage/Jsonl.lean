@@ -18,6 +18,10 @@ structure JsonlStorage where
   issues : IO.Ref (Std.HashMap IssueId Issue)
   /-- In-memory dependency store -/
   dependencies : IO.Ref (List Dependency)
+  /-- In-memory comments store -/
+  comments : IO.Ref (List Comment)
+  /-- Next comment ID -/
+  nextCommentId : IO.Ref Nat
   /-- ID generator state -/
   idGenState : IO.Ref IdGenerator.State
   /-- Dirty flag for save optimization -/
@@ -33,21 +37,50 @@ def issuesPath (storage : JsonlStorage) : System.FilePath :=
 def deletionsPath (storage : JsonlStorage) : System.FilePath :=
   storage.beadsDir / "deletions.jsonl"
 
+/-- Path to comments.jsonl -/
+def commentsPath (storage : JsonlStorage) : System.FilePath :=
+  storage.beadsDir / "comments.jsonl"
+
 /-- Create a new JSONL storage at the given path -/
 def create (beadsDir : System.FilePath) : IO JsonlStorage := do
   -- Create .beads directory if it doesn't exist
   IO.FS.createDirAll beadsDir
   let issues ← IO.mkRef {}
   let dependencies ← IO.mkRef []
+  let comments ← IO.mkRef []
+  let nextCommentId ← IO.mkRef 1
   let idGenState ← IO.mkRef {}
   let dirty ← IO.mkRef false
-  pure { beadsDir, issues, dependencies, idGenState, dirty }
+  pure { beadsDir, issues, dependencies, comments, nextCommentId, idGenState, dirty }
 
 /-- Parse a JSONL file into a list of JSON values -/
 def parseJsonl (content : String) : List (Except String Json) :=
   content.splitOn "\n"
     |>.filter (fun s => !s.trim.isEmpty)
     |>.map Json.parse
+
+/-- Load comments from JSONL file -/
+def loadComments (storage : JsonlStorage) : IO Unit := do
+  let path := storage.commentsPath
+  if ← path.pathExists then
+    let content ← IO.FS.readFile path
+    let lines := parseJsonl content
+    let mut comments : List Comment := []
+    let mut maxId : Nat := 0
+
+    for lineResult in lines do
+      match lineResult with
+      | .ok json =>
+        match fromJson? json with
+        | .ok (comment : Comment) =>
+          comments := comment :: comments
+          if comment.id > maxId then maxId := comment.id
+        | .error _ => pure ()
+      | .error _ => pure ()
+
+    storage.comments.set comments
+    storage.nextCommentId.set (maxId + 1)
+  pure ()
 
 /-- Load issues from JSONL file -/
 def loadIssues (storage : JsonlStorage) : IO Unit := do
@@ -83,7 +116,9 @@ def loadIssues (storage : JsonlStorage) : IO Unit := do
     storage.issues.set issueMap
     storage.dependencies.set deps
     storage.idGenState.modify fun s => { s with existingIds }
-  pure ()
+
+  -- Also load comments
+  loadComments storage
 
 /-- Helper: lookup with default in HashMap -/
 def hashMapFindD {α β : Type} [BEq α] [Hashable α] (m : Std.HashMap α β) (k : α) (d : β) : β :=
@@ -92,6 +127,17 @@ def hashMapFindD {α β : Type} [BEq α] [Hashable α] (m : Std.HashMap α β) (
 /-- Helper: check if haystack contains needle as substring -/
 def containsSubstr (haystack needle : String) : Bool :=
   needle.isEmpty || (haystack.splitOn needle).length > 1
+
+/-- Save comments to JSONL file -/
+def saveComments (storage : JsonlStorage) : IO Unit := do
+  let comments ← storage.comments.get
+  if comments.isEmpty then
+    -- Don't write empty file
+    pure ()
+  else
+    let lines := comments.map fun c => (toJson c).compress
+    let content := "\n".intercalate lines.reverse
+    IO.FS.writeFile (storage.commentsPath) (content ++ "\n")
 
 /-- Save issues to JSONL file -/
 def saveIssues (storage : JsonlStorage) : IO Unit := do
@@ -121,6 +167,9 @@ def saveIssues (storage : JsonlStorage) : IO Unit := do
 
   let content := "\n".intercalate lines.reverse
   IO.FS.writeFile (storage.issuesPath) (content ++ "\n")
+
+  -- Also save comments
+  saveComments storage
   storage.dirty.set false
 
 /-- Check if adding a dependency would create a cycle (BFS from target to source) -/
@@ -248,6 +297,28 @@ def toStorageOps (storage : JsonlStorage) : StorageOps := {
   getLabels := fun issueId => do
     let issues ← storage.issues.get
     pure (issues.get? issueId |>.map (·.labels) |>.getD [])
+
+  addComment := fun issueId text author => do
+    let id ← storage.nextCommentId.get
+    storage.nextCommentId.set (id + 1)
+    let now ← IO.Process.output { cmd := "date", args := #["+%s"] }
+    let timestamp := now.stdout.trim.toNat?.getD 0
+    let comment : Comment := {
+      id := id
+      issueId := issueId
+      author := author
+      text := text
+      createdAt := timestamp
+    }
+    storage.comments.modify fun cs => comment :: cs
+    storage.dirty.set true
+    pure id
+
+  getComments := fun issueId => do
+    let comments ← storage.comments.get
+    pure (comments.filter (·.issueId == issueId) |>.reverse)
+
+  getAllComments := storage.comments.get
 
   getReadyWork := fun filter => do
     let issues ← storage.issues.get

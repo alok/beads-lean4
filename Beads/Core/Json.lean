@@ -178,6 +178,25 @@ instance : ToJson BlockedIssue where
                   |>.insert "blocked_by" (.arr (b.blockedBy.map (toJson ·)).toArray))
     | _ => issueJson
 
+-- Comment JSON
+instance : ToJson Comment where
+  toJson c := .mkObj [
+    ("id", .num c.id),
+    ("issue_id", toJson c.issueId),
+    ("author", .str c.author),
+    ("text", .str c.text),
+    ("created_at", .num c.createdAt)
+  ]
+
+instance : FromJson Comment where
+  fromJson? j := do
+    let id ← j.getObjValAs? Nat "id"
+    let issueId ← j.getObjValAs? IssueId "issue_id"
+    let author ← j.getObjValAs? String "author"
+    let text ← j.getObjValAs? String "text"
+    let createdAt ← j.getObjValAs? Nat "created_at"
+    pure { id, issueId, author, text, createdAt }
+
 -- Statistics JSON
 instance : ToJson Statistics where
   toJson s := .mkObj [

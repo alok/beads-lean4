@@ -540,6 +540,74 @@ def cmdLabelList (cfg : CLIConfig) (args : List String) : IO UInt32 := do
     IO.eprintln "Usage: beads label list <issue-id>"
     pure 1
 
+/-- Format a timestamp for display -/
+def formatTimestamp (ts : Nat) : IO String := do
+  let result ← IO.Process.output { cmd := "date", args := #["-r", toString ts, "+%Y-%m-%d %H:%M"] }
+  pure result.stdout.trim
+
+/-- Command: add a comment to an issue -/
+def cmdCommentAdd (cfg : CLIConfig) (args : List String) : IO UInt32 := do
+  match args with
+  | issueIdStr :: textParts =>
+    if textParts.isEmpty then
+      IO.eprintln "Error: comment add requires text"
+      IO.eprintln "Usage: beads comment add <issue-id> <text>"
+      pure 1
+    else
+      let ops ← openStorage cfg
+      let issueId : IssueId := ⟨issueIdStr⟩
+      match ← ops.getIssue issueId with
+      | some _ =>
+        let text := " ".intercalate textParts
+        let commentId ← ops.addComment issueId text "cli"
+        ops.save
+        if cfg.jsonOutput then
+          IO.println (Json.mkObj [
+            ("id", Json.num commentId),
+            ("issueId", Json.str issueIdStr),
+            ("text", Json.str text)
+          ]).compress
+        else
+          IO.println s!"Added comment #{commentId} to {issueIdStr}"
+        pure 0
+      | none =>
+        IO.eprintln s!"Error: Issue not found: {issueIdStr}"
+        pure 1
+  | _ =>
+    IO.eprintln "Error: comment add requires issue ID and text"
+    IO.eprintln "Usage: beads comment add <issue-id> <text>"
+    pure 1
+
+/-- Command: list comments on an issue -/
+def cmdCommentList (cfg : CLIConfig) (args : List String) : IO UInt32 := do
+  match args.head? with
+  | some issueIdStr =>
+    let ops ← openStorage cfg
+    let issueId : IssueId := ⟨issueIdStr⟩
+    match ← ops.getIssue issueId with
+    | some _ =>
+      let comments ← ops.getComments issueId
+      if cfg.jsonOutput then
+        let json := Json.arr (comments.map toJson).toArray
+        IO.println json.compress
+      else
+        if comments.isEmpty then
+          IO.println s!"No comments on {issueIdStr}"
+        else
+          IO.println s!"Comments on {issueIdStr}:"
+          for comment in comments do
+            let dateStr ← formatTimestamp comment.createdAt
+            IO.println s!"  #{comment.id} ({comment.author}, {dateStr}):"
+            IO.println s!"    {comment.text}"
+      pure 0
+    | none =>
+      IO.eprintln s!"Error: Issue not found: {issueIdStr}"
+      pure 1
+  | none =>
+    IO.eprintln "Error: comment list requires an issue ID"
+    IO.eprintln "Usage: beads comment list <issue-id>"
+    pure 1
+
 /-- Command: show statistics -/
 def cmdStats (cfg : CLIConfig) (_args : List String) : IO UInt32 := do
   let ops ← openStorage cfg
@@ -1104,6 +1172,8 @@ def printHelp : IO Unit := do
   IO.println "  label add <id> <label>         Add label to issue"
   IO.println "  label remove <id> <label>      Remove label from issue"
   IO.println "  label list <id>                List labels on issue"
+  IO.println "  comment add <id> <text>        Add comment to issue"
+  IO.println "  comment list <id>              List comments on issue"
   IO.println "  dep add <from> <to> [--type]   Add dependency"
   IO.println "  dep remove <from> <to>         Remove dependency"
   IO.println "  dep tree <id> [--mermaid]      Show dependency tree"
@@ -1163,6 +1233,9 @@ def main (args : List String) : IO UInt32 := do
   | "label" :: "remove" :: rest => cmdLabelRemove cfg rest
   | "label" :: "list" :: rest => cmdLabelList cfg rest
   | "label" :: rest => cmdLabelList cfg rest  -- Default to list
+  | "comment" :: "add" :: rest => cmdCommentAdd cfg rest
+  | "comment" :: "list" :: rest => cmdCommentList cfg rest
+  | "comment" :: rest => cmdCommentList cfg rest  -- Default to list
   | "init" :: rest => cmdInit cfg rest
   | "dep" :: "add" :: rest => cmdDepAdd cfg rest
   | "dep" :: "remove" :: rest => cmdDepRemove cfg rest

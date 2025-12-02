@@ -38,6 +38,11 @@ structure StorageOps where
   removeLabel : IssueId → String → String → IO Unit
   getLabels : IssueId → IO (List String)
 
+  -- Comment operations
+  addComment : IssueId → String → String → IO Nat  -- Returns comment ID
+  getComments : IssueId → IO (List Comment)
+  getAllComments : IO (List Comment)
+
   -- Ready work operations
   getReadyWork : WorkFilter → IO (List Issue)
   getBlockedIssues : IO (List BlockedIssue)
