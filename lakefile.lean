@@ -45,3 +45,12 @@ lean_exe «beads-docs» where
   srcDir := "docs"
   root := `Main
   supportInterpreter := true
+
+-- Property-based tests using Plausible
+lean_lib BeadsTest where
+  roots := #[`BeadsTest.Arbitrary, `BeadsTest.IdGeneration, `BeadsTest.TypeInvariants, `BeadsTest.JsonRoundtrip, `BeadsTest.CycleDetection]
+
+-- Test executable
+lean_exe «beads-test» where
+  root := `BeadsTest.Main
+  supportInterpreter := true
