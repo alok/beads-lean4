@@ -388,6 +388,83 @@ def cmdClose (cfg : CLIConfig) (args : List String) : IO UInt32 := do
     IO.eprintln "Usage: beads close <id> [reason | --reason <text>]"
     pure 1
 
+/-- Command: reopen a closed issue -/
+def cmdReopen (cfg : CLIConfig) (args : List String) : IO UInt32 := do
+  match args.head? with
+  | some idStr =>
+    let ops ← openStorage cfg
+    let now ← currentTimestamp
+
+    let issueId : IssueId := ⟨idStr⟩
+    match ← ops.getIssue issueId with
+    | some issue =>
+      if issue.status != .closed then
+        IO.eprintln s!"Issue {idStr} is not closed (status: {issue.status.toString})"
+        pure 1
+      else
+        ops.updateIssue issueId (fun i => { i with
+          status := .open
+          closedAt := none
+          closeReason := ""
+          updatedAt := now
+        }) "cli"
+        ops.save
+
+        match ← ops.getIssue issueId with
+        | some updated =>
+          let json := toJson updated
+          let text := s!"Reopened issue: {idStr}"
+          outputResult cfg json text
+          pure 0
+        | none =>
+          IO.eprintln "Error: Issue disappeared after reopen"
+          pure 1
+    | none =>
+      IO.eprintln s!"Error: Issue not found: {idStr}"
+      pure 1
+  | none =>
+    IO.eprintln "Error: reopen requires an issue ID"
+    IO.eprintln "Usage: beads reopen <id>"
+    pure 1
+
+/-- Command: search issues -/
+def cmdSearch (cfg : CLIConfig) (args : List String) : IO UInt32 := do
+  match args.head? with
+  | some query =>
+    let ops ← openStorage cfg
+
+    -- Parse additional filters from remaining args
+    let rec parseFilter (filter : IssueFilter) (args : List String) : IssueFilter :=
+      match args with
+      | [] => filter
+      | "--status" :: s :: rest =>
+        parseFilter { filter with status := Status.fromString? s } rest
+      | "--type" :: t :: rest =>
+        parseFilter { filter with issueType := IssueType.fromString? t } rest
+      | "--limit" :: n :: rest =>
+        parseFilter { filter with limit := n.toNat?.getD 100 } rest
+      | _ :: rest => parseFilter filter rest
+
+    let baseFilter := { IssueFilter.default with titleSearch := query }
+    let filter := parseFilter baseFilter args.tail!
+    let issues ← ops.searchIssues filter
+
+    if cfg.jsonOutput then
+      let json := Json.arr (issues.map toJson).toArray
+      IO.println json.compress
+    else
+      if issues.isEmpty then
+        IO.println s!"No issues matching '{query}'"
+      else
+        IO.println s!"Found {issues.length} issue(s) matching '{query}':"
+        for issue in issues do
+          IO.println (formatIssueShort issue)
+    pure 0
+  | none =>
+    IO.eprintln "Error: search requires a query"
+    IO.eprintln "Usage: beads search <query> [--status <s>] [--type <t>] [--limit <n>]"
+    pure 1
+
 /-- Command: add a label to an issue -/
 def cmdLabelAdd (cfg : CLIConfig) (args : List String) : IO UInt32 := do
   match args with
@@ -549,42 +626,111 @@ def collectTreeLoop (ops : StorageOps) (allDeps : List Dependency) (rootId : Iss
 termination_by fuel
 decreasing_by all_goals simp_all; omega
 
+/-- Generate mermaid diagram for dependency graph -/
+def generateMermaid (ops : StorageOps) (rootId : IssueId) : IO String := do
+  let allDeps ← ops.getAllDependencies
+  let allIssues ← ops.getAllIssues
+  let issueMap : Std.HashMap IssueId Issue := allIssues.foldl (fun m i => m.insert i.id i) {}
+
+  -- Collect all relevant issues (root + anything it depends on or that depends on it)
+  let relevantDeps := allDeps.filter fun d =>
+    d.issueId == rootId || d.dependsOnId == rootId ||
+    allDeps.any (fun d2 => d2.issueId == rootId && d2.dependsOnId == d.issueId) ||
+    allDeps.any (fun d2 => d2.dependsOnId == rootId && d2.issueId == d.dependsOnId)
+
+  let relevantIds := (relevantDeps.map (·.issueId) ++ relevantDeps.map (·.dependsOnId) ++ [rootId]).eraseDups
+
+  let mut lines : List String := ["graph TD"]
+
+  -- Add nodes with styling
+  for id in relevantIds do
+    match issueMap.get? id with
+    | some issue =>
+      let shortTitle := if issue.title.length > 30 then issue.title.take 27 ++ "..." else issue.title
+      let escapedTitle := shortTitle.replace "\"" "'"
+      let shape := match issue.status with
+        | .closed => s!"  {id.value}[[\"{escapedTitle}\"]]"  -- Double brackets for closed
+        | .inProgress => s!"  {id.value}((\"{escapedTitle}\"))"  -- Circle for in progress
+        | _ => s!"  {id.value}[\"{escapedTitle}\"]"  -- Rectangle for open/blocked
+      lines := lines ++ [shape]
+    | none => pure ()
+
+  -- Add edges with labels
+  for dep in relevantDeps do
+    let label := match dep.depType with
+      | .blocks => "blocks"
+      | .parentChild => "parent"
+      | .related => "related"
+      | .discoveredFrom => "from"
+    let arrow := if dep.depType.affectsBlocking then "-->" else "-.->"
+    lines := lines ++ [s!"  {dep.dependsOnId.value} {arrow}|{label}| {dep.issueId.value}"]
+
+  -- Add styling
+  lines := lines ++ [
+    "  classDef closed fill:#90EE90,stroke:#228B22",
+    "  classDef inprogress fill:#FFE4B5,stroke:#FF8C00",
+    "  classDef blocked fill:#FFB6C1,stroke:#DC143C"
+  ]
+
+  -- Apply styles to nodes
+  for id in relevantIds do
+    match issueMap.get? id with
+    | some issue =>
+      match issue.status with
+      | .closed => lines := lines ++ [s!"  class {id.value} closed"]
+      | .inProgress => lines := lines ++ [s!"  class {id.value} inprogress"]
+      | _ => pure ()
+    | none => pure ()
+
+  pure ("\n".intercalate lines)
+
 /-- Command: show dependency tree -/
 def cmdDepTree (cfg : CLIConfig) (args : List String) : IO UInt32 := do
   match args.head? with
   | some issueIdStr =>
     let ops ← openStorage cfg
-
     let issueId : IssueId := ⟨issueIdStr⟩
+
+    -- Check for --mermaid flag
+    let mermaidMode := args.contains "--mermaid" || args.contains "-m"
+
     match ← ops.getIssue issueId with
     | some _ =>
-      let allDeps ← ops.getAllDependencies
-      let tree ← collectTreeLoop ops allDeps issueId [(issueId, 0)] {} [] 100
-
-      if cfg.jsonOutput then
-        let json := Json.arr (tree.map fun node =>
-          Json.mkObj [
-            ("id", toJson node.issue.id),
-            ("title", Json.str node.issue.title),
-            ("status", toJson node.issue.status),
-            ("depth", Json.num node.depth),
-            ("truncated", Json.bool node.truncated)
-          ]
-        ).toArray
-        IO.println json.compress
+      if mermaidMode then
+        let mermaid ← generateMermaid ops issueId
+        if cfg.jsonOutput then
+          IO.println (Json.mkObj [("mermaid", Json.str mermaid)]).compress
+        else
+          IO.println mermaid
+        pure 0
       else
-        for node in tree do
-          let indent := String.ofList (List.replicate (node.depth * 2) ' ')
-          let statusMark := if node.issue.status == .closed then "✓" else "○"
-          let truncMark := if node.truncated then " ..." else ""
-          IO.println s!"{indent}{statusMark} {node.issue.id.value}: {node.issue.title}{truncMark}"
-      pure 0
+        let allDeps ← ops.getAllDependencies
+        let tree ← collectTreeLoop ops allDeps issueId [(issueId, 0)] {} [] 100
+
+        if cfg.jsonOutput then
+          let json := Json.arr (tree.map fun node =>
+            Json.mkObj [
+              ("id", toJson node.issue.id),
+              ("title", Json.str node.issue.title),
+              ("status", toJson node.issue.status),
+              ("depth", Json.num node.depth),
+              ("truncated", Json.bool node.truncated)
+            ]
+          ).toArray
+          IO.println json.compress
+        else
+          for node in tree do
+            let indent := String.ofList (List.replicate (node.depth * 2) ' ')
+            let statusMark := if node.issue.status == .closed then "✓" else "○"
+            let truncMark := if node.truncated then " ..." else ""
+            IO.println s!"{indent}{statusMark} {node.issue.id.value}: {node.issue.title}{truncMark}"
+        pure 0
     | none =>
       IO.eprintln s!"Error: Issue not found: {issueIdStr}"
       pure 1
   | none =>
     IO.eprintln "Error: dep tree requires an issue ID"
-    IO.eprintln "Usage: beads dep tree <issue-id>"
+    IO.eprintln "Usage: beads dep tree <issue-id> [--mermaid]"
     pure 1
 
 /-- Command: show blocked issues -/
@@ -616,14 +762,16 @@ def printHelp : IO Unit := do
   IO.println "Commands:"
   IO.println "  create <title> [description]   Create a new issue"
   IO.println "  list [filters]                 List issues"
+  IO.println "  search <query> [filters]       Search issues by title"
   IO.println "  show <id>                      Show issue details"
   IO.println "  update <id> [options]          Update an issue"
   IO.println "  close <id> [reason]            Close an issue"
+  IO.println "  reopen <id>                    Reopen a closed issue"
   IO.println "  label add <id> <label>         Add label to issue"
   IO.println "  label remove <id> <label>      Remove label from issue"
   IO.println "  label list <id>                List labels on issue"
   IO.println "  dep add <from> <to> [--type]   Add dependency (from blocks to)"
-  IO.println "  dep tree <id>                  Show dependency tree"
+  IO.println "  dep tree <id> [--mermaid]      Show dependency tree"
   IO.println "  ready [filters]                Show ready (unblocked) work"
   IO.println "  blocked                        Show blocked issues"
   IO.println "  stats                          Show issue statistics"
@@ -665,9 +813,11 @@ def main (args : List String) : IO UInt32 := do
     pure 0
   | "create" :: rest => cmdCreate cfg rest
   | "list" :: rest => cmdList cfg rest
+  | "search" :: rest => cmdSearch cfg rest
   | "show" :: rest => cmdShow cfg rest
   | "update" :: rest => cmdUpdate cfg rest
   | "close" :: rest => cmdClose cfg rest
+  | "reopen" :: rest => cmdReopen cfg rest
   | "label" :: "add" :: rest => cmdLabelAdd cfg rest
   | "label" :: "remove" :: rest => cmdLabelRemove cfg rest
   | "label" :: "list" :: rest => cmdLabelList cfg rest
