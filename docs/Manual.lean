@@ -17,41 +17,122 @@ Beads is a distributed issue tracker designed to be:
  * *Type-safe*: Written in Lean 4 with compile-time guarantees
  * *Dependency-aware*: Track blocking relationships with cycle detection
 
-# Quick Start
+# Core Types
 
-## Installation
+The core types in Beads provide compile-time safety through Lean 4's type system.
 
+## Status
+
+Issue status is an inductive type with four values:
+
+```lean
+inductive Status where
+  | open       -- Available for work
+  | inProgress -- Currently being worked on
+  | blocked    -- Waiting on dependencies
+  | closed     -- Completed
 ```
-git clone https://github.com/alok/beads-lean4
-cd beads-lean4
-lake build
+
+The `isOpenForWork` method returns `true` for `open` and `inProgress` statuses.
+
+## Issue Type
+
+```lean
+inductive IssueType where
+  | bug      -- Something broken
+  | feature  -- New capability
+  | task     -- General work item
+  | epic     -- Container for related issues
+  | chore    -- Maintenance work
 ```
 
-## Create Your First Issue
+## Dependency Type
 
+Four relationship types between issues:
+
+```lean
+inductive DependencyType where
+  | blocks         -- A blocks B: B cannot start until A closes
+  | related        -- Informational link only
+  | parentChild    -- B is a subtask of A
+  | discoveredFrom -- B was found while working on A
 ```
-beads create "Fix login bug" "Users cannot login"
+
+The `affectsBlocking` property is `true` for `blocks` and `parentChild` - these types
+can prevent an issue from being "ready" for work.
+
+## Priority
+
+Priority uses `Fin 5`, guaranteeing values 0-4 at compile time:
+
+ * *P0*: Critical - drop everything
+ * *P1*: High - address soon
+ * *P2*: Normal (default)
+ * *P3*: Low - when time permits
+ * *P4*: Backlog
+
+# Issue Structure
+
+```lean
+structure Issue where
+  id : IssueId              -- Hash-based, collision-resistant
+  title : String
+  description : String
+  status : Status
+  priority : Priority       -- Fin 5, compile-time bounded
+  issueType : IssueType
+  assignee : Option String
+  labels : List String
+  createdAt : Nat           -- Unix timestamp
+  updatedAt : Nat
+  closedAt : Option Nat     -- Set when status = closed
 ```
 
-# Core Concepts
+Issue IDs use the format `bd-XXXXXX` where X is a hex digit, derived from
+a SHA256 hash of title, description, and timestamp.
 
-## Issues
+# Dependency Structure
 
-Every issue has:
+```lean
+structure Dependency where
+  issueId : IssueId       -- The dependent issue
+  dependsOnId : IssueId   -- The dependency
+  depType : DependencyType
+  createdAt : Nat
+  createdBy : String
+```
 
- * *ID*: Collision-resistant hash-based ID (e.g., `bd-a1b2c3`)
- * *Status*: `open`, `in_progress`, or `closed`
- * *Priority*: P0 (critical) to P4 (low)
- * *Type*: `task`, `bug`, `feature`, or `epic`
+# Graph Algorithms
 
-## Dependencies
+## Cycle Detection
 
-Issues can depend on each other with four relationship types:
+Beads uses BFS to detect cycles before adding dependencies:
 
- * *blocks*: Issue A blocks Issue B (affects ready work)
- * *related*: Informational link
- * *parent-child*: Hierarchical decomposition
- * *discovered-from*: Issue B was found while working on A
+```lean
+def wouldCreateCycle (g : Graph) (from_ to : IssueId) : Bool :=
+  if from_ == to then true       -- Self-loop
+  else hasPath g to from_        -- Path from target back to source
+```
+
+## Blocked Set Computation
+
+An issue is blocked if:
+1. It has a `blocks` or `parentChild` dependency to an open issue
+2. Its parent is blocked (one level propagation)
+
+```lean
+def computeBlockedSet (issues : List Issue) (deps : List Dependency) : HashSet IssueId
+```
+
+## Ready Issues
+
+Ready issues are open and not blocked:
+
+```lean
+def getReadyIssues (issues : List Issue) (deps : List Dependency) : List Issue :=
+  issues.filter fun issue =>
+    issue.status.isOpenForWork && !blocked.contains issue.id
+```
 
 # Command Reference
 
@@ -59,6 +140,7 @@ Issues can depend on each other with four relationship types:
 
 ```
 beads create "Title" "Description"
+beads create "Title" --type bug --priority 0
 beads --json create "Implement feature X"
 ```
 
@@ -115,11 +197,11 @@ beads dep tree bd-a1b2c3
 ## Workflow Commands
 
 ```
-beads ready
-beads ready --assignee alice
-beads ready --unassigned
-beads blocked
-beads stats
+beads ready                    -- List unblocked, open issues
+beads ready --assignee alice   -- Filter by assignee
+beads ready --unassigned       -- Only unassigned issues
+beads blocked                  -- List blocked issues with reasons
+beads stats                    -- Summary statistics
 ```
 
 # JSON Output for Agents
@@ -132,54 +214,58 @@ beads --json stats
 beads --json create "New task"
 ```
 
+Example agent workflow:
+
+```bash
+READY=$(beads --json ready --unassigned --limit 1)
+ISSUE_ID=$(echo $READY | jq -r '.[0].id')
+beads update $ISSUE_ID --status in_progress --assignee agent
+# ... do work ...
+beads close $ISSUE_ID "Implemented in PR #123"
+```
+
 # Storage Format
 
 Issues are stored in `.beads/issues.jsonl`:
 
-```
+```json
 {"id":"bd-a1b2c3","title":"Fix bug","status":"open","priority":2,...}
 {"id":"bd-d4e5f6","title":"Add feature","status":"closed",...}
 ```
 
+The JSONL format is ideal for git:
+ * Each issue is one line → clean diffs
+ * No merge conflicts on different issues
+ * Human-readable for debugging
+
 # Architecture
 
-## Core Types
-
- * `Types.lean`: Status, Priority, IssueType, DependencyType
- * `Issue.lean`: Issue, Dependency, BlockedIssue structures
- * `Id.lean`: Hash-based ID generation with collision resistance
- * `Json.lean`: Serialization for all types
-
-## Storage
-
- * `Storage.lean`: Abstract StorageOps interface
- * `Jsonl.lean`: JSONL file-backed implementation with BFS cycle detection
-
-## CLI
-
-Full command-line interface with argument parsing and JSON output support.
-
-# Examples
-
-## Agent Workflow
+## Module Structure
 
 ```
-READY=$(beads --json ready --unassigned --limit 1)
-ISSUE_ID=$(echo $READY | jq -r '.[0].id')
-beads update $ISSUE_ID --status in_progress --assignee agent
-beads close $ISSUE_ID "Implemented in PR #123"
+Beads/
+├── Core/
+│   ├── Types.lean      -- Status, IssueType, DependencyType, Priority
+│   ├── Issue.lean      -- Issue, Dependency, IssueId structures
+│   ├── Id.lean         -- Hash-based ID generation
+│   ├── Json.lean       -- JSON serialization
+│   ├── Graph.lean      -- Cycle detection, blocking computation
+│   └── Validated.lean  -- Type-safe validated issues
+└── Storage/
+    ├── Storage.lean    -- StorageOps typeclass
+    ├── Jsonl.lean      -- JSONL file backend
+    └── Sqlite/         -- SQLite backend (optional)
 ```
 
-## Project Planning
+## Property Testing
 
-```
-beads create "User Authentication"
-beads create "Login page"
-beads dep add bd-login bd-auth --type parent-child
-beads create "OAuth integration"
-beads dep add bd-oauth bd-login
-beads dep tree bd-auth
-```
+Beads includes 70+ property-based tests using Plausible:
+
+ * ID generation collision resistance
+ * JSON roundtrip for all types
+ * Cycle detection correctness
+ * Blocking computation semantics
+ * Type invariants (Priority bounds, closed timestamps)
 
 # License
 
