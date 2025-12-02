@@ -1171,6 +1171,132 @@ def cmdBlocked (cfg : CLIConfig) (_args : List String) : IO UInt32 := do
         IO.println s!"  blocked by: {blockerIds}"
   pure 0
 
+/-- Command: find stale issues (not updated in N days) -/
+def cmdStale (cfg : CLIConfig) (args : List String) : IO UInt32 := do
+  let ops ← openStorage cfg
+  let now ← currentTimestamp
+
+  -- Parse --days option, default 30
+  let days := match args with
+    | "--days" :: n :: _ => n.toNat?.getD 30
+    | n :: _ => n.toNat?.getD 30
+    | [] => 30
+
+  let cutoff := now - (days * 24 * 60 * 60)
+  let allIssues ← ops.getAllIssues
+
+  -- Find open/in-progress issues not updated since cutoff
+  let stale := allIssues.filter fun issue =>
+    issue.status.isOpenForWork && issue.updatedAt < cutoff
+
+  -- Sort by updatedAt ascending (oldest first)
+  let sorted := stale.toArray.qsort (fun a b => a.updatedAt < b.updatedAt) |>.toList
+
+  if cfg.jsonOutput then
+    let json := Json.arr (sorted.map fun issue =>
+      let daysStale := (now - issue.updatedAt) / (24 * 60 * 60)
+      let issueJson := toJson issue
+      match issueJson with
+      | .obj fields => .obj (fields.insert "days_stale" (.num daysStale))
+      | _ => issueJson
+    ).toArray
+    IO.println json.compress
+  else
+    if sorted.isEmpty then
+      IO.println s!"No stale issues (nothing older than {days} days)"
+    else
+      IO.println s!"Stale issues (not updated in {days}+ days):"
+      for issue in sorted do
+        let daysStale := (now - issue.updatedAt) / (24 * 60 * 60)
+        IO.println s!"{formatIssueShort issue} ({daysStale} days)"
+  pure 0
+
+/-- Command: manage configuration -/
+def cmdConfigList (cfg : CLIConfig) : IO UInt32 := do
+  let configPath := cfg.beadsDir / "config.json"
+  if ← configPath.pathExists then
+    let content ← IO.FS.readFile configPath
+    if cfg.jsonOutput then
+      IO.println content
+    else
+      IO.println "Configuration:"
+      IO.println content
+  else
+    if cfg.jsonOutput then
+      IO.println "{}"
+    else
+      IO.println "No configuration set"
+  pure 0
+
+def cmdConfigGet (cfg : CLIConfig) (key : String) : IO UInt32 := do
+  let configPath := cfg.beadsDir / "config.json"
+  if ← configPath.pathExists then
+    let content ← IO.FS.readFile configPath
+    match Json.parse content with
+    | .ok json =>
+      match json.getObjValD key with
+      | .null =>
+        if !cfg.jsonOutput then IO.eprintln s!"Key not found: {key}"
+        pure 1
+      | value =>
+        if cfg.jsonOutput then
+          IO.println (Json.mkObj [(key, value)]).compress
+        else
+          IO.println s!"{key}={value}"
+        pure 0
+    | .error _ =>
+      IO.eprintln "Error: Invalid config file"
+      pure 1
+  else
+    if !cfg.jsonOutput then IO.eprintln s!"Key not found: {key}"
+    pure 1
+
+def cmdConfigSet (cfg : CLIConfig) (key value : String) : IO UInt32 := do
+  let configPath := cfg.beadsDir / "config.json"
+  let existingJson : Json ← if ← configPath.pathExists then
+    let content ← IO.FS.readFile configPath
+    match Json.parse content with
+    | .ok json => pure json
+    | _ => pure (Json.mkObj [])
+  else
+    pure (Json.mkObj [])
+
+  let newJson := match existingJson with
+    | .obj fields => Json.obj (fields.insert key (Json.str value))
+    | _ => Json.mkObj [(key, Json.str value)]
+  IO.FS.writeFile configPath (newJson.pretty)
+
+  if cfg.jsonOutput then
+    IO.println (Json.mkObj [(key, Json.str value)]).compress
+  else
+    IO.println s!"Set {key}={value}"
+  pure 0
+
+def cmdConfigUnset (cfg : CLIConfig) (key : String) : IO UInt32 := do
+  let configPath := cfg.beadsDir / "config.json"
+  if ← configPath.pathExists then
+    let content ← IO.FS.readFile configPath
+    match Json.parse content with
+    | .ok json =>
+      match json with
+      | .obj fields =>
+        let newJson := Json.obj (fields.erase key)
+        IO.FS.writeFile configPath (newJson.pretty)
+        if cfg.jsonOutput then
+          IO.println (Json.mkObj [("unset", Json.str key)]).compress
+        else
+          IO.println s!"Unset {key}"
+        pure 0
+      | _ =>
+        IO.eprintln "Error: Invalid config file"
+        pure 1
+    | _ =>
+      IO.eprintln "Error: Invalid config file"
+      pure 1
+  else
+    if !cfg.jsonOutput then IO.eprintln "No configuration file"
+    pure 1
+
 /-- Print help message -/
 def printHelp : IO Unit := do
   IO.println "beads - git-backed distributed issue tracker (Lean 4 port)"
@@ -1203,6 +1329,11 @@ def printHelp : IO Unit := do
   IO.println "  delete <id> [--force]          Delete an issue"
   IO.println "  count [filters]                Count issues (returns just number)"
   IO.println "  validate                       Check data integrity"
+  IO.println "  stale [days]                   Find issues not updated in N days (default: 30)"
+  IO.println "  config list                    List all config values"
+  IO.println "  config get <key>               Get config value"
+  IO.println "  config set <key> <value>       Set config value"
+  IO.println "  config unset <key>             Remove config value"
   IO.println "  help                           Show this help"
   IO.println ""
   IO.println "Flags:"
@@ -1266,6 +1397,12 @@ def main (args : List String) : IO UInt32 := do
   | "ready" :: rest => cmdReady cfg rest
   | "blocked" :: rest => cmdBlocked cfg rest
   | "stats" :: rest => cmdStats cfg rest
+  | "stale" :: rest => cmdStale cfg rest
+  | "config" :: "list" :: _ => cmdConfigList cfg
+  | "config" :: "get" :: key :: _ => cmdConfigGet cfg key
+  | "config" :: "set" :: key :: value :: _ => cmdConfigSet cfg key value
+  | "config" :: "unset" :: key :: _ => cmdConfigUnset cfg key
+  | "config" :: _ => cmdConfigList cfg  -- Default to list
   | cmd :: _ =>
     IO.eprintln s!"Unknown command: {cmd}"
     IO.eprintln "Run 'beads help' for usage"
