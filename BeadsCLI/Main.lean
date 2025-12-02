@@ -1580,6 +1580,266 @@ def cmdEdit (cfg : CLIConfig) (args : List String) : IO UInt32 := do
     IO.eprintln "Usage: beads edit <id>"
     pure 1
 
+/-- Command: quick assign -/
+def cmdAssign (cfg : CLIConfig) (args : List String) : IO UInt32 := do
+  match args with
+  | idStr :: assignee :: _ =>
+    let ops ← openStorage cfg
+    let now ← currentTimestamp
+    let issueId : IssueId := ⟨idStr⟩
+
+    match ← ops.getIssue issueId with
+    | some _ =>
+      let assigneeVal := if assignee == "none" || assignee == "" then none else some assignee
+      ops.updateIssue issueId (fun i => { i with assignee := assigneeVal, updatedAt := now }) "cli"
+      ops.save
+
+      match ← ops.getIssue issueId with
+      | some updated =>
+        if cfg.jsonOutput then
+          IO.println (toJson updated).compress
+        else
+          match assigneeVal with
+          | some a => IO.println s!"Assigned {idStr} to {a}"
+          | none => IO.println s!"Unassigned {idStr}"
+        pure 0
+      | none =>
+        IO.eprintln "Error: Issue disappeared after assign"
+        pure 1
+    | none =>
+      IO.eprintln s!"Error: Issue not found: {idStr}"
+      pure 1
+  | [idStr] =>
+    -- Unassign
+    let ops ← openStorage cfg
+    let now ← currentTimestamp
+    let issueId : IssueId := ⟨idStr⟩
+
+    match ← ops.getIssue issueId with
+    | some _ =>
+      ops.updateIssue issueId (fun i => { i with assignee := none, updatedAt := now }) "cli"
+      ops.save
+      if cfg.jsonOutput then
+        IO.println (Json.mkObj [("id", Json.str idStr), ("assignee", Json.null)]).compress
+      else
+        IO.println s!"Unassigned {idStr}"
+      pure 0
+    | none =>
+      IO.eprintln s!"Error: Issue not found: {idStr}"
+      pure 1
+  | _ =>
+    IO.eprintln "Error: assign requires an issue ID"
+    IO.eprintln "Usage: beads assign <id> [assignee|none]"
+    pure 1
+
+/-- Command: epic management -/
+def cmdEpicChildren (cfg : CLIConfig) (args : List String) : IO UInt32 := do
+  match args.head? with
+  | some idStr =>
+    let ops ← openStorage cfg
+    let epicId : IssueId := ⟨idStr⟩
+
+    match ← ops.getIssue epicId with
+    | some epic =>
+      if epic.issueType != .epic then
+        IO.eprintln s!"Warning: {idStr} is not an epic (type: {epic.issueType.toString})"
+
+      -- Find children (issues that have parent-child dependency pointing to this epic)
+      let allDeps ← ops.getAllDependencies
+      let childDeps := allDeps.filter fun d => d.dependsOnId == epicId && d.depType == .parentChild
+      let childIds := childDeps.map (·.issueId)
+
+      let mut children : List Issue := []
+      for childId in childIds do
+        match ← ops.getIssue childId with
+        | some child => children := child :: children
+        | none => pure ()
+
+      if cfg.jsonOutput then
+        let json := Json.arr (children.map toJson).toArray
+        IO.println json.compress
+      else
+        if children.isEmpty then
+          IO.println s!"No children for {idStr}"
+        else
+          IO.println s!"Children of {idStr} ({children.length}):"
+          for child in children.reverse do
+            IO.println (formatIssueShort child)
+      pure 0
+    | none =>
+      IO.eprintln s!"Error: Issue not found: {idStr}"
+      pure 1
+  | none =>
+    IO.eprintln "Error: epic children requires an epic ID"
+    IO.eprintln "Usage: beads epic children <epic-id>"
+    pure 1
+
+def cmdEpicReadyToClose (cfg : CLIConfig) (_args : List String) : IO UInt32 := do
+  let ops ← openStorage cfg
+
+  let allIssues ← ops.getAllIssues
+  let allDeps ← ops.getAllDependencies
+  let issueMap : Std.HashMap IssueId Issue := allIssues.foldl (fun m i => m.insert i.id i) {}
+
+  -- Find epics not closed
+  let epicsNotClosed := allIssues.filter fun i => i.issueType == .epic && i.status != .closed
+  let parentChildDeps := allDeps.filter (·.depType == .parentChild)
+
+  -- Epic is eligible if it has children and all are closed
+  let eligible := epicsNotClosed.filter fun epic =>
+    let children := parentChildDeps.filter (·.dependsOnId == epic.id) |>.map (·.issueId)
+    !children.isEmpty && children.all fun childId =>
+      match issueMap.get? childId with
+      | some child => child.status == .closed
+      | none => true
+
+  if cfg.jsonOutput then
+    let json := Json.arr (eligible.map toJson).toArray
+    IO.println json.compress
+  else
+    if eligible.isEmpty then
+      IO.println "No epics ready to close"
+    else
+      IO.println s!"Epics ready to close ({eligible.length}):"
+      for epic in eligible do
+        IO.println (formatIssueShort epic)
+  pure 0
+
+/-- Command: batch operations -/
+def cmdBatchClose (cfg : CLIConfig) (args : List String) : IO UInt32 := do
+  let ops ← openStorage cfg
+  let now ← currentTimestamp
+
+  -- Parse --reason flag
+  let (ids, reason) := match args.reverse with
+    | r :: "--reason" :: rest => (rest.reverse, r)
+    | _ => (args.filter (fun (s : String) => !s.startsWith "--"), "")
+
+  let mut closed := 0
+  let mut errors := 0
+
+  for idStr in ids do
+    let issueId : IssueId := ⟨idStr⟩
+    match ← ops.getIssue issueId with
+    | some issue =>
+      if issue.status == .closed then
+        errors := errors + 1
+      else
+        ops.updateIssue issueId (fun i => { i with
+          status := .closed
+          closedAt := some now
+          closeReason := reason
+          updatedAt := now
+        }) "cli"
+        closed := closed + 1
+    | none =>
+      errors := errors + 1
+
+  ops.save
+
+  if cfg.jsonOutput then
+    IO.println (Json.mkObj [
+      ("closed", Json.num closed),
+      ("errors", Json.num errors)
+    ]).compress
+  else
+    IO.println s!"Closed {closed} issue(s), {errors} error(s)"
+  pure (if errors > 0 then 1 else 0)
+
+def cmdBatchAssign (cfg : CLIConfig) (args : List String) : IO UInt32 := do
+  let ops ← openStorage cfg
+  let now ← currentTimestamp
+
+  -- Parse --to flag
+  let (ids, assignee) := match args with
+    | "--to" :: a :: rest => (rest, some a)
+    | _ =>
+      let filtered := args.filter (fun (s : String) => !s.startsWith "--")
+      match filtered.reverse with
+      | a :: rest => (rest.reverse, if a == "none" then none else some a)
+      | _ => ([], none)
+
+  let mut assigned := 0
+
+  for idStr in ids do
+    let issueId : IssueId := ⟨idStr⟩
+    match ← ops.getIssue issueId with
+    | some _ =>
+      ops.updateIssue issueId (fun i => { i with assignee := assignee, updatedAt := now }) "cli"
+      assigned := assigned + 1
+    | none => pure ()
+
+  ops.save
+
+  if cfg.jsonOutput then
+    IO.println (Json.mkObj [
+      ("assigned", Json.num assigned),
+      ("to", match assignee with | some a => Json.str a | none => Json.null)
+    ]).compress
+  else
+    match assignee with
+    | some a => IO.println s!"Assigned {assigned} issue(s) to {a}"
+    | none => IO.println s!"Unassigned {assigned} issue(s)"
+  pure 0
+
+def cmdBatchLabel (cfg : CLIConfig) (args : List String) : IO UInt32 := do
+  let ops ← openStorage cfg
+
+  -- Parse --add or --remove flag
+  let rec parseArgs (mode : String) (label : String) (ids : List String) (remaining : List String) :=
+    match remaining with
+    | "--add" :: l :: rest => parseArgs "add" l ids rest
+    | "--remove" :: l :: rest => parseArgs "remove" l ids rest
+    | id :: rest => parseArgs mode label (id :: ids) rest
+    | [] => (mode, label, ids.reverse)
+
+  let (mode, label, ids) := parseArgs "add" "" [] args
+
+  if label.isEmpty then
+    IO.eprintln "Error: batch label requires --add or --remove with a label"
+    IO.eprintln "Usage: beads batch label --add <label> <id1> <id2> ..."
+    return 1
+
+  let mut modified := 0
+
+  for idStr in ids do
+    let issueId : IssueId := ⟨idStr⟩
+    match ← ops.getIssue issueId with
+    | some _ =>
+      if mode == "add" then
+        ops.addLabel issueId label "cli"
+      else
+        ops.removeLabel issueId label "cli"
+      modified := modified + 1
+    | none => pure ()
+
+  ops.save
+
+  if cfg.jsonOutput then
+    IO.println (Json.mkObj [
+      ("modified", Json.num modified),
+      ("label", Json.str label),
+      ("action", Json.str mode)
+    ]).compress
+  else
+    IO.println s!"{mode.capitalize} label '{label}' on {modified} issue(s)"
+  pure 0
+
+/-- Command: show version -/
+def cmdVersion (cfg : CLIConfig) : IO UInt32 := do
+  let version := "0.1.0"
+  let build := "lean4-v4.26.0-rc2"
+
+  if cfg.jsonOutput then
+    IO.println (Json.mkObj [
+      ("version", Json.str version),
+      ("build", Json.str build),
+      ("backend", Json.str (if cfg.backend == .sqlite then "sqlite" else "jsonl"))
+    ]).compress
+  else
+    IO.println s!"beads {version} ({build})"
+  pure 0
+
 /-- Print help message -/
 def printHelp : IO Unit := do
   IO.println "beads - git-backed distributed issue tracker (Lean 4 port)"
@@ -1621,7 +1881,14 @@ def printHelp : IO Unit := do
   IO.println "  message inbox [agent]          List inbox messages"
   IO.println "  message read <id>              Read a message"
   IO.println "  message ack <id>               Acknowledge a message"
+  IO.println "  assign <id> [assignee]         Assign/unassign an issue"
+  IO.println "  epic children <id>             List children of an epic"
+  IO.println "  epic ready-to-close            Find epics ready to close"
+  IO.println "  batch close <id1> <id2> ...    Close multiple issues"
+  IO.println "  batch assign <id1> ... <name>  Assign multiple issues"
+  IO.println "  batch label --add <l> <ids>    Add label to multiple issues"
   IO.println "  edit <id>                      Edit an issue interactively"
+  IO.println "  version                        Show version info"
   IO.println "  help                           Show this help"
   IO.println ""
   IO.println "Flags:"
@@ -1696,7 +1963,15 @@ def main (args : List String) : IO UInt32 := do
   | "message" :: "read" :: rest => cmdMessageRead cfg rest
   | "message" :: "ack" :: rest => cmdMessageAck cfg rest
   | "message" :: rest => cmdMessageInbox cfg rest  -- Default to inbox
+  | "assign" :: rest => cmdAssign cfg rest
+  | "epic" :: "children" :: rest => cmdEpicChildren cfg rest
+  | "epic" :: "ready-to-close" :: rest => cmdEpicReadyToClose cfg rest
+  | "epic" :: rest => cmdEpicReadyToClose cfg rest  -- Default
+  | "batch" :: "close" :: rest => cmdBatchClose cfg rest
+  | "batch" :: "assign" :: rest => cmdBatchAssign cfg rest
+  | "batch" :: "label" :: rest => cmdBatchLabel cfg rest
   | "edit" :: rest => cmdEdit cfg rest
+  | "version" :: _ => cmdVersion cfg
   | cmd :: _ =>
     IO.eprintln s!"Unknown command: {cmd}"
     IO.eprintln "Run 'beads help' for usage"
