@@ -733,6 +733,86 @@ def cmdDepTree (cfg : CLIConfig) (args : List String) : IO UInt32 := do
     IO.eprintln "Usage: beads dep tree <issue-id> [--mermaid]"
     pure 1
 
+/-- Command: initialize beads in current directory -/
+def cmdInit (cfg : CLIConfig) (_args : List String) : IO UInt32 := do
+  let beadsDir := cfg.beadsDir
+  if ← beadsDir.pathExists then
+    IO.eprintln s!"Error: {beadsDir} already exists"
+    pure 1
+  else
+    IO.FS.createDirAll beadsDir
+    -- Create empty issues.jsonl
+    IO.FS.writeFile (beadsDir / "issues.jsonl") ""
+    IO.FS.writeFile (beadsDir / "dependencies.jsonl") ""
+    IO.FS.writeFile (beadsDir / "labels.jsonl") ""
+
+    let text := s!"Initialized beads in {beadsDir}"
+    if cfg.jsonOutput then
+      IO.println (Json.mkObj [("initialized", Json.str beadsDir.toString)]).compress
+    else
+      IO.println text
+    pure 0
+
+/-- Command: remove a dependency -/
+def cmdDepRemove (cfg : CLIConfig) (args : List String) : IO UInt32 := do
+  match args with
+  | fromId :: toId :: _ =>
+    let ops ← openStorage cfg
+    ops.removeDependency ⟨fromId⟩ ⟨toId⟩ "cli"
+    ops.save
+
+    let text := s!"Removed dependency: {fromId} no longer depends on {toId}"
+    if cfg.jsonOutput then
+      IO.println (Json.mkObj [
+        ("from", Json.str fromId),
+        ("to", Json.str toId),
+        ("removed", Json.bool true)
+      ]).compress
+    else
+      IO.println text
+    pure 0
+  | _ =>
+    IO.eprintln "Error: dep remove requires two issue IDs"
+    IO.eprintln "Usage: beads dep remove <issue-id> <depends-on-id>"
+    pure 1
+
+/-- Command: export all data to JSON -/
+def cmdExport (cfg : CLIConfig) (args : List String) : IO UInt32 := do
+  let ops ← openStorage cfg
+
+  let issues ← ops.getAllIssues
+  let deps ← ops.getAllDependencies
+
+  -- Collect all labels
+  let mut allLabels : List (IssueId × List String) := []
+  for issue in issues do
+    let labels ← ops.getLabels issue.id
+    if !labels.isEmpty then
+      allLabels := (issue.id, labels) :: allLabels
+
+  let exportJson := Json.mkObj [
+    ("version", Json.str "1.0"),
+    ("exportedAt", Json.num (← currentTimestamp)),
+    ("issues", Json.arr (issues.map toJson).toArray),
+    ("dependencies", Json.arr (deps.map toJson).toArray),
+    ("labels", Json.arr (allLabels.map fun (id, labels) =>
+      Json.mkObj [("issueId", toJson id), ("labels", Json.arr (labels.map Json.str).toArray)]
+    ).toArray)
+  ]
+
+  match args.head? with
+  | some filename =>
+    IO.FS.writeFile filename (exportJson.pretty)
+    if !cfg.jsonOutput then
+      IO.println s!"Exported {issues.length} issues to {filename}"
+    else
+      IO.println (Json.mkObj [("exported", Json.str filename), ("count", Json.num issues.length)]).compress
+  | none =>
+    -- Output to stdout
+    IO.println (exportJson.pretty)
+
+  pure 0
+
 /-- Command: show blocked issues -/
 def cmdBlocked (cfg : CLIConfig) (_args : List String) : IO UInt32 := do
   let ops ← openStorage cfg
@@ -760,6 +840,7 @@ def printHelp : IO Unit := do
   IO.println "Usage: beads [--json] <command> [args...]"
   IO.println ""
   IO.println "Commands:"
+  IO.println "  init                           Initialize beads in current directory"
   IO.println "  create <title> [description]   Create a new issue"
   IO.println "  list [filters]                 List issues"
   IO.println "  search <query> [filters]       Search issues by title"
@@ -770,11 +851,13 @@ def printHelp : IO Unit := do
   IO.println "  label add <id> <label>         Add label to issue"
   IO.println "  label remove <id> <label>      Remove label from issue"
   IO.println "  label list <id>                List labels on issue"
-  IO.println "  dep add <from> <to> [--type]   Add dependency (from blocks to)"
+  IO.println "  dep add <from> <to> [--type]   Add dependency"
+  IO.println "  dep remove <from> <to>         Remove dependency"
   IO.println "  dep tree <id> [--mermaid]      Show dependency tree"
   IO.println "  ready [filters]                Show ready (unblocked) work"
   IO.println "  blocked                        Show blocked issues"
   IO.println "  stats                          Show issue statistics"
+  IO.println "  export [file]                  Export all data to JSON"
   IO.println "  help                           Show this help"
   IO.println ""
   IO.println "Flags:"
@@ -822,8 +905,11 @@ def main (args : List String) : IO UInt32 := do
   | "label" :: "remove" :: rest => cmdLabelRemove cfg rest
   | "label" :: "list" :: rest => cmdLabelList cfg rest
   | "label" :: rest => cmdLabelList cfg rest  -- Default to list
+  | "init" :: rest => cmdInit cfg rest
   | "dep" :: "add" :: rest => cmdDepAdd cfg rest
+  | "dep" :: "remove" :: rest => cmdDepRemove cfg rest
   | "dep" :: "tree" :: rest => cmdDepTree cfg rest
+  | "export" :: rest => cmdExport cfg rest
   | "ready" :: rest => cmdReady cfg rest
   | "blocked" :: rest => cmdBlocked cfg rest
   | "stats" :: rest => cmdStats cfg rest
