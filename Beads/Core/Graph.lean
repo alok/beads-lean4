@@ -145,4 +145,36 @@ where
 
 end Graph
 
+/-- Compute the set of blocked issue IDs (pure version for testing)
+    An issue is blocked if:
+    1. It has a blocking dependency (blocks or parentChild) to an open issue
+    2. Its parent is blocked (one level propagation) -/
+def computeBlockedSet (issues : List Issue) (deps : List Dependency) : Std.HashSet IssueId :=
+  let issueMap : Std.HashMap IssueId Issue := issues.foldl (fun m i => m.insert i.id i) {}
+
+  -- Find directly blocked issues
+  let directlyBlocked := deps.filter fun dep =>
+    dep.depType.affectsBlocking &&
+    match issueMap.get? dep.dependsOnId with
+    | some issue => issue.status != .closed
+    | none => false
+
+  -- Build blocked set
+  let blocked := directlyBlocked.foldl (fun s dep => s.insert dep.issueId) {}
+
+  -- Propagate to children (one level)
+  let childDeps := deps.filter (·.depType == .parentChild)
+  childDeps.foldl (fun s dep =>
+    if s.contains dep.dependsOnId then s.insert dep.issueId else s) blocked
+
+/-- Check if an issue is blocked -/
+def isBlocked (issues : List Issue) (deps : List Dependency) (id : IssueId) : Bool :=
+  (computeBlockedSet issues deps).contains id
+
+/-- Get list of ready (unblocked, open) issues -/
+def getReadyIssues (issues : List Issue) (deps : List Dependency) : List Issue :=
+  let blocked := computeBlockedSet issues deps
+  issues.filter fun issue =>
+    issue.status.isOpenForWork && !blocked.contains issue.id
+
 end Beads

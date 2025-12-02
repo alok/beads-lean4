@@ -48,7 +48,7 @@ lean_exe «beads-docs» where
 
 -- Property-based tests using Plausible
 lean_lib BeadsTest where
-  roots := #[`BeadsTest.Arbitrary, `BeadsTest.IdGeneration, `BeadsTest.TypeInvariants, `BeadsTest.JsonRoundtrip, `BeadsTest.CycleDetection]
+  roots := #[`BeadsTest.Arbitrary, `BeadsTest.IdGeneration, `BeadsTest.TypeInvariants, `BeadsTest.JsonRoundtrip, `BeadsTest.CycleDetection, `BeadsTest.BlockingComputation]
 
 -- Test executable
 lean_exe «beads-test» where
