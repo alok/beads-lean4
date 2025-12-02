@@ -813,6 +813,140 @@ def cmdExport (cfg : CLIConfig) (args : List String) : IO UInt32 := do
 
   pure 0
 
+/-- Command: delete an issue -/
+def cmdDelete (cfg : CLIConfig) (args : List String) : IO UInt32 := do
+  match args.head? with
+  | some idStr =>
+    let ops ← openStorage cfg
+    let issueId : IssueId := ⟨idStr⟩
+
+    match ← ops.getIssue issueId with
+    | some issue =>
+      -- Check if --force flag is present
+      let force := args.contains "--force" || args.contains "-f"
+
+      -- Check for dependents (issues that depend on this one)
+      let dependents ← ops.getDependents issueId
+      if !dependents.isEmpty && !force then
+        IO.eprintln s!"Error: Issue {idStr} has {dependents.length} dependent(s). Use --force to delete anyway."
+        IO.eprintln "Dependents:"
+        for dep in dependents do
+          IO.eprintln s!"  - {dep.issueId.value}"
+        pure 1
+      else
+        -- Delete all dependencies involving this issue
+        let deps ← ops.getDependencies issueId
+        for dep in deps do
+          ops.removeDependency issueId dep.dependsOnId "cli"
+        for dep in dependents do
+          ops.removeDependency dep.issueId issueId "cli"
+
+        -- Delete the issue
+        ops.deleteIssue issueId
+        ops.save
+
+        let text := s!"Deleted issue: {idStr} ({issue.title})"
+        if cfg.jsonOutput then
+          IO.println (Json.mkObj [
+            ("deleted", Json.str idStr),
+            ("title", Json.str issue.title)
+          ]).compress
+        else
+          IO.println text
+        pure 0
+    | none =>
+      IO.eprintln s!"Error: Issue not found: {idStr}"
+      pure 1
+  | none =>
+    IO.eprintln "Error: delete requires an issue ID"
+    IO.eprintln "Usage: beads delete <id> [--force]"
+    pure 1
+
+/-- Command: import data from JSON export -/
+def cmdImport (cfg : CLIConfig) (args : List String) : IO UInt32 := do
+  match args.head? with
+  | some filename =>
+    let ops ← openStorage cfg
+
+    -- Read and parse JSON file
+    let content ← IO.FS.readFile filename
+    match Json.parse content with
+    | .error e =>
+      IO.eprintln s!"Error parsing JSON: {e}"
+      pure 1
+    | .ok json =>
+      -- Extract issues array
+      let issuesJson := json.getObjValD "issues"
+      let depsJson := json.getObjValD "dependencies"
+      let labelsJson := json.getObjValD "labels"
+
+      let mut importedIssues := 0
+      let mut importedDeps := 0
+      let mut skippedIssues := 0
+      let mut cycleErrors := 0
+
+      -- Import issues
+      match issuesJson with
+      | .arr issues =>
+        for issueJson in issues do
+          match fromJson? issueJson with
+          | .ok (issue : Issue) =>
+            -- Check if issue already exists
+            match ← ops.getIssue issue.id with
+            | some _ =>
+              skippedIssues := skippedIssues + 1
+            | none =>
+              -- Create with specific ID - use createIssue then update
+              let _ ← ops.createIssue issue "import"
+              importedIssues := importedIssues + 1
+          | .error _ => pure ()
+      | _ => pure ()
+
+      -- Import dependencies
+      match depsJson with
+      | .arr deps =>
+        for depJson in deps do
+          match fromJson? depJson with
+          | .ok (dep : Dependency) =>
+            match ← ops.addDependency dep "import" with
+            | .ok () => importedDeps := importedDeps + 1
+            | .error _ => cycleErrors := cycleErrors + 1
+          | .error _ => pure ()
+      | _ => pure ()
+
+      -- Import labels
+      match labelsJson with
+      | .arr labelEntries =>
+        for entry in labelEntries do
+          let issueIdJson := entry.getObjValD "issueId"
+          let labelsArr := entry.getObjValD "labels"
+          match (fromJson? issueIdJson : Except String IssueId), labelsArr with
+          | .ok issueId, .arr labels =>
+            for labelJson in labels do
+              match labelJson with
+              | .str label => ops.addLabel issueId label "import"
+              | _ => pure ()
+          | _, _ => pure ()
+      | _ => pure ()
+
+      ops.save
+
+      let text := s!"Imported {importedIssues} issues, {importedDeps} dependencies (skipped {skippedIssues} existing, {cycleErrors} cycle errors)"
+      if cfg.jsonOutput then
+        IO.println (Json.mkObj [
+          ("importedIssues", Json.num importedIssues),
+          ("importedDeps", Json.num importedDeps),
+          ("skippedIssues", Json.num skippedIssues),
+          ("cycleErrors", Json.num cycleErrors)
+        ]).compress
+      else
+        IO.println text
+      pure 0
+  | none =>
+    IO.eprintln "Error: import requires a JSON file"
+    IO.eprintln "Usage: beads import <file.json>"
+    pure 1
+
 /-- Command: show blocked issues -/
 def cmdBlocked (cfg : CLIConfig) (_args : List String) : IO UInt32 := do
   let ops ← openStorage cfg
@@ -858,6 +992,8 @@ def printHelp : IO Unit := do
   IO.println "  blocked                        Show blocked issues"
   IO.println "  stats                          Show issue statistics"
   IO.println "  export [file]                  Export all data to JSON"
+  IO.println "  import <file>                  Import data from JSON export"
+  IO.println "  delete <id> [--force]          Delete an issue"
   IO.println "  help                           Show this help"
   IO.println ""
   IO.println "Flags:"
@@ -910,6 +1046,8 @@ def main (args : List String) : IO UInt32 := do
   | "dep" :: "remove" :: rest => cmdDepRemove cfg rest
   | "dep" :: "tree" :: rest => cmdDepTree cfg rest
   | "export" :: rest => cmdExport cfg rest
+  | "import" :: rest => cmdImport cfg rest
+  | "delete" :: rest => cmdDelete cfg rest
   | "ready" :: rest => cmdReady cfg rest
   | "blocked" :: rest => cmdBlocked cfg rest
   | "stats" :: rest => cmdStats cfg rest
