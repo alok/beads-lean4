@@ -24,7 +24,19 @@ extern_lib sqlite_ffi (pkg) := do
   let oTarget ← sqliteFFIOTarget pkg
   buildStaticLib (pkg.staticLibDir / name) #[oTarget]
 
--- Core library
+-- Core types library (no storage dependencies)
+lean_lib BeadsCore where
+  roots := #[`Beads.Core]
+
+-- Storage interface and implementations
+lean_lib BeadsStorage where
+  roots := #[`Beads.Storage]
+
+-- Sync subsystem (depends on Storage)
+lean_lib BeadsSync where
+  roots := #[`Beads.Sync]
+
+-- Main library (re-exports everything)
 @[default_target]
 lean_lib Beads where
   roots := #[`Beads]

@@ -1840,6 +1840,159 @@ def cmdVersion (cfg : CLIConfig) : IO UInt32 := do
     IO.println s!"beads {version} ({build})"
   pure 0
 
+/-- Command: sync with git -/
+def cmdSync (cfg : CLIConfig) (args : List String) : IO UInt32 := do
+  let beadsDir := cfg.beadsDir
+  let jsonlPath := beadsDir / "issues.jsonl"
+
+  -- Parse flags
+  let dryRun := args.any (· == "--dry-run")
+  let noPull := args.any (· == "--no-pull")
+  let noPush := args.any (· == "--no-push")
+  let flushOnly := args.any (· == "--flush-only")
+  let importOnly := args.any (· == "--import-only")
+
+  -- Check if in git repo
+  if !(← Sync.isGitRepo) then
+    if cfg.jsonOutput then
+      IO.println (Json.mkObj [("error", Json.str "not in a git repository")]).compress
+    else
+      IO.eprintln "Error: not in a git repository"
+      IO.eprintln "Hint: run 'git init' to initialize a repository"
+    return 1
+
+  -- Check for unmerged paths
+  if ← Sync.hasUnmergedPaths then
+    if cfg.jsonOutput then
+      IO.println (Json.mkObj [("error", Json.str "unmerged paths or merge in progress")]).compress
+    else
+      IO.eprintln "Error: unmerged paths or merge in progress"
+      IO.eprintln "Hint: resolve conflicts first, then run 'beads sync' again"
+    return 1
+
+  -- Open storage
+  let ops ← openStorage cfg
+
+  -- If flush-only, just export
+  if flushOnly then
+    let allIssues ← ops.getAllIssues
+    if dryRun then
+      IO.println "→ [DRY RUN] Would export pending changes to JSONL"
+    else
+      let result ← Sync.exportToJSONL allIssues jsonlPath
+      if result.skipped then
+        IO.eprintln s!"Export skipped: {result.reason}"
+        return 1
+      if !cfg.jsonOutput then
+        IO.println s!"→ Exported {result.issueCount} issues to JSONL"
+    if cfg.jsonOutput then
+      IO.println (Json.mkObj [("flushed", Json.bool true)]).compress
+    return 0
+
+  -- If import-only, just import
+  if importOnly then
+    let existingIssues ← ops.getAllIssues
+    if dryRun then
+      IO.println "→ [DRY RUN] Would import from JSONL"
+    else
+      let (_, importResult, sanitizeResult) ← Sync.importWithSanitization existingIssues jsonlPath
+      if !cfg.jsonOutput then
+        if sanitizeResult.removedCount > 0 then
+          IO.println s!"→ Sanitized: removed {sanitizeResult.removedCount} deleted issues"
+        IO.println s!"→ Imported: {importResult.created} created, {importResult.updated} updated, {importResult.skipped} skipped"
+    if cfg.jsonOutput then
+      IO.println (Json.mkObj [("imported", Json.bool true)]).compress
+    return 0
+
+  -- Full sync flow
+  let gitStatus ← Sync.getGitStatus beadsDir
+
+  if dryRun then
+    IO.println "→ [DRY RUN] Sync preview:"
+    IO.println s!"  Repository: {if gitStatus.isRepo then "yes" else "no"}"
+    IO.println s!"  Branch: {gitStatus.currentBranch.getD "(unknown)"}"
+    IO.println s!"  Has upstream: {gitStatus.hasUpstream}"
+    IO.println s!"  Has local changes: {gitStatus.hasBeadsChanges}"
+    if cfg.jsonOutput then
+      IO.println (Json.mkObj [("dry_run", Json.bool true)]).compress
+    return 0
+
+  -- Step 1: Export pending changes
+  let allIssues ← ops.getAllIssues
+  let result ← Sync.exportWithZFCCheck allIssues jsonlPath
+  if result.skipped then
+    if !cfg.jsonOutput then
+      IO.eprintln s!"Export skipped (ZFC safety): {result.reason}"
+      IO.eprintln "→ Importing JSONL to sync with source of truth..."
+    -- Import first to sync
+    let (_, importResult, _) ← Sync.importWithSanitization allIssues jsonlPath
+    if !cfg.jsonOutput then
+      IO.println s!"→ Import: {importResult.created} created, {importResult.updated} updated"
+  else
+    if !cfg.jsonOutput then
+      IO.println s!"→ Exported {result.issueCount} issues"
+
+  -- Capture snapshot before pull
+  Sync.captureLeftSnapshot jsonlPath
+
+  -- Step 2: Check for changes to commit
+  let hasChanges ← Sync.hasBeadsChanges beadsDir
+  if hasChanges then
+    if !cfg.jsonOutput then
+      IO.println "→ Committing changes..."
+    let commitResult ← Sync.commitBeadsDir beadsDir "bd sync: update issues"
+    if !commitResult.success then
+      if !cfg.jsonOutput then
+        IO.eprintln s!"Warning: commit failed: {commitResult.output}"
+  else
+    if !cfg.jsonOutput then
+      IO.println "→ No changes to commit"
+
+  -- Step 3: Pull from remote (if configured)
+  if !noPull && gitStatus.hasUpstream then
+    if !cfg.jsonOutput then
+      IO.println "→ Pulling from remote..."
+    let pullResult ← Sync.pull
+    if !pullResult.success then
+      if !cfg.jsonOutput then
+        IO.eprintln s!"Warning: pull failed: {pullResult.output}"
+        IO.eprintln "Hint: resolve conflicts and run 'beads sync' again"
+      -- Don't exit - continue with push if we have changes
+
+    -- Import after pull
+    let currentIssues ← ops.getAllIssues
+    let (_, importResult, sanitizeResult) ← Sync.importWithSanitization currentIssues jsonlPath
+    if !cfg.jsonOutput then
+      if sanitizeResult.removedCount > 0 then
+        IO.println s!"→ Removed {sanitizeResult.removedCount} deleted issues"
+      IO.println s!"→ Import: {importResult.created} created, {importResult.updated} updated"
+
+    -- Update base snapshot
+    Sync.updateBaseSnapshot jsonlPath
+
+  -- Step 4: Push to remote (if configured)
+  let hasChangesAfterPull ← Sync.hasBeadsChanges beadsDir
+  if !noPush && gitStatus.hasUpstream && hasChangesAfterPull then
+    if !cfg.jsonOutput then
+      IO.println "→ Pushing to remote..."
+    let pushResult ← Sync.push
+    if !pushResult.success then
+      if !cfg.jsonOutput then
+        IO.eprintln s!"Warning: push failed: {pushResult.output}"
+
+  -- Cleanup
+  Sync.cleanupSnapshots jsonlPath
+
+  if cfg.jsonOutput then
+    IO.println (Json.mkObj [
+      ("synced", Json.bool true),
+      ("branch", match gitStatus.currentBranch with | some b => Json.str b | none => Json.null)
+    ]).compress
+  else
+    IO.println "\n✓ Sync complete"
+
+  return 0
+
 /-- Print help message -/
 def printHelp : IO Unit := do
   IO.println "beads - git-backed distributed issue tracker (Lean 4 port)"
@@ -1869,6 +2022,7 @@ def printHelp : IO Unit := do
   IO.println "  stats                          Show issue statistics"
   IO.println "  export [file]                  Export all data to JSON"
   IO.println "  import <file>                  Import data from JSON export"
+  IO.println "  sync [options]                 Sync with git remote"
   IO.println "  delete <id> [--force]          Delete an issue"
   IO.println "  count [filters]                Count issues (returns just number)"
   IO.println "  validate                       Check data integrity"
@@ -1912,6 +2066,13 @@ def printHelp : IO Unit := do
   IO.println "  --assignee <name>              Filter by assignee"
   IO.println "  --search <text>                Search in title"
   IO.println "  --limit <n>                    Limit results"
+  IO.println ""
+  IO.println "Sync options:"
+  IO.println "  --dry-run                      Show what would be done"
+  IO.println "  --no-pull                      Skip pulling from remote"
+  IO.println "  --no-push                      Skip pushing to remote"
+  IO.println "  --flush-only                   Only export and commit"
+  IO.println "  --import-only                  Only pull and import"
   IO.println ""
   IO.println "Dependency types: blocks, related, parent-child, discovered-from"
 
@@ -1972,6 +2133,7 @@ def main (args : List String) : IO UInt32 := do
   | "batch" :: "label" :: rest => cmdBatchLabel cfg rest
   | "edit" :: rest => cmdEdit cfg rest
   | "version" :: _ => cmdVersion cfg
+  | "sync" :: rest => cmdSync cfg rest
   | cmd :: _ =>
     IO.eprintln s!"Unknown command: {cmd}"
     IO.eprintln "Run 'beads help' for usage"
