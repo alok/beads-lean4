@@ -4,10 +4,18 @@ Agent-friendly with --json output on all commands
 -/
 import Beads
 import Beads.Storage.Sqlite.Storage
+import Beads.Sync.ActivityLog
+import Beads.Sync.Templates
+import Beads.Sync.Hooks
+import Beads.Sync.Watcher
 import Lean.Data.Json
 
 open Beads
 open Lean Json
+open Beads.Sync.ActivityLog
+open Beads.Sync.Templates
+open Beads.Sync.Hooks
+open Beads.Sync.Watcher
 
 /-- Storage backend type -/
 inductive StorageBackend where
@@ -132,6 +140,17 @@ def cmdCreate (cfg : CLIConfig) (args : List String) : IO UInt32 := do
 
     let newId ← ops.createIssue issue "cli"
     ops.save
+
+    -- Log the activity
+    let log := ActivityLog.forDirectory cfg.beadsDir
+    log.append {
+      timestamp := now
+      actor := "cli"
+      action := .create
+      issueId := some newId.value
+      title := some title
+      details := s!"Created {issueTypeOpt.getD .task |>.toString}: {title}"
+    }
 
     let createdIssue := { issue with id := newId }
     let json := toJson createdIssue
@@ -370,6 +389,17 @@ def cmdClose (cfg : CLIConfig) (args : List String) : IO UInt32 := do
           updatedAt := now
         }) "cli"
         ops.save
+
+        -- Log the activity
+        let log := ActivityLog.forDirectory cfg.beadsDir
+        log.append {
+          timestamp := now
+          actor := "cli"
+          action := .close
+          issueId := some idStr
+          title := some issue.title
+          details := if reason.isEmpty then s!"Closed: {issue.title}" else s!"Closed: {issue.title} ({reason})"
+        }
 
         match ← ops.getIssue issueId with
         | some updated =>
@@ -1836,6 +1866,268 @@ def cmdBatchLabel (cfg : CLIConfig) (args : List String) : IO UInt32 := do
     IO.println s!"{mode.capitalize} label '{label}' on {modified} issue(s)"
   pure 0
 
+/-- Command: show activity log -/
+def cmdLog (cfg : CLIConfig) (args : List String) : IO UInt32 := do
+  let log := ActivityLog.forDirectory cfg.beadsDir
+
+  -- Parse options
+  let limit := match args with
+    | "--limit" :: n :: _ => n.toNat?.getD 20
+    | "-n" :: n :: _ => n.toNat?.getD 20
+    | n :: _ => n.toNat?.getD 20
+    | _ => 20
+
+  let entries ← log.readRecent limit
+
+  if cfg.jsonOutput then
+    let json := Json.arr (entries.map toJson).toArray
+    IO.println json.compress
+  else
+    if entries.isEmpty then
+      IO.println "No activity recorded yet"
+    else
+      for entry in entries do
+        let formatted ← entry.format
+        IO.println formatted
+  pure 0
+
+/-- Command: list templates -/
+def cmdTemplateList (cfg : CLIConfig) : IO UInt32 := do
+  let tm := TemplateManager.forDirectory cfg.beadsDir
+  let templates ← tm.list
+
+  if cfg.jsonOutput then
+    let json := Json.arr (templates.map toJson).toArray
+    IO.println json.compress
+  else
+    if templates.isEmpty then
+      IO.println "No templates defined. Run 'beads template init' to create built-in templates."
+    else
+      for t in templates do
+        IO.println s!"{t.name}: {t.description}"
+  pure 0
+
+/-- Command: show template details -/
+def cmdTemplateShow (cfg : CLIConfig) (name : String) : IO UInt32 := do
+  let tm := TemplateManager.forDirectory cfg.beadsDir
+  match ← tm.get name with
+  | some t =>
+    if cfg.jsonOutput then
+      IO.println (toJson t).compress
+    else
+      IO.println s!"Name:        {t.name}"
+      IO.println s!"Description: {t.description}"
+      IO.println s!"Type:        {t.defaultType.toString}"
+      IO.println s!"Priority:    P{t.defaultPriority.val}"
+      if !t.titlePrefix.isEmpty then
+        IO.println s!"Title prefix: {t.titlePrefix}"
+      if !t.defaultLabels.isEmpty then
+        IO.println s!"Labels:      {", ".intercalate t.defaultLabels}"
+      if !t.bodyTemplate.isEmpty then
+        IO.println s!"Body template:\n{t.bodyTemplate}"
+    pure 0
+  | none =>
+    IO.eprintln s!"Template not found: {name}"
+    pure 1
+
+/-- Command: initialize built-in templates -/
+def cmdTemplateInit (cfg : CLIConfig) : IO UInt32 := do
+  let tm := TemplateManager.forDirectory cfg.beadsDir
+  tm.createBuiltins
+
+  if cfg.jsonOutput then
+    IO.println (Json.mkObj [("initialized", Json.bool true)]).compress
+  else
+    IO.println "Created built-in templates: bug, feature, epic, chore"
+  pure 0
+
+/-- Command: create issue from template -/
+def cmdTemplateUse (cfg : CLIConfig) (args : List String) : IO UInt32 := do
+  match args with
+  | templateName :: title :: rest =>
+    let tm := TemplateManager.forDirectory cfg.beadsDir
+    match ← tm.get templateName with
+    | some template =>
+      let ops ← openStorage cfg
+      let now ← currentTimestamp
+
+      let finalTitle := template.titlePrefix ++ title
+      let description := if rest.isEmpty then template.bodyTemplate else " ".intercalate rest
+
+      let issue : Issue := {
+        id := ⟨""⟩
+        title := finalTitle
+        description := description
+        design := ""
+        acceptanceCriteria := ""
+        notes := ""
+        status := .open
+        priority := template.defaultPriority
+        issueType := template.defaultType
+        assignee := none
+        estimatedMinutes := none
+        createdAt := now
+        updatedAt := now
+        closedAt := none
+        closeReason := ""
+        externalRef := none
+        labels := template.defaultLabels
+      }
+
+      let newId ← ops.createIssue issue "cli"
+      ops.save
+
+      -- Log the activity
+      let log := ActivityLog.forDirectory cfg.beadsDir
+      log.append {
+        timestamp := now
+        actor := "cli"
+        action := .create
+        issueId := some newId.value
+        title := some finalTitle
+        details := s!"Created from template '{templateName}': {finalTitle}"
+      }
+
+      let createdIssue := { issue with id := newId }
+      let json := toJson createdIssue
+      let text := s!"Created issue from '{templateName}': {newId.value}"
+      outputResult cfg json text
+      pure 0
+    | none =>
+      IO.eprintln s!"Template not found: {templateName}"
+      pure 1
+  | [_] =>
+    IO.eprintln "Error: template use requires both template name and title"
+    IO.eprintln "Usage: beads template use <name> <title> [description...]"
+    pure 1
+  | [] =>
+    IO.eprintln "Error: template use requires a template name and title"
+    IO.eprintln "Usage: beads template use <name> <title> [description...]"
+    pure 1
+
+/-- Command: list hooks -/
+def cmdHookList (cfg : CLIConfig) : IO UInt32 := do
+  let hm := HookManager.forDirectory cfg.beadsDir
+  let installed ← hm.list
+
+  if cfg.jsonOutput then
+    let points := installed.map (Json.str ∘ HookPoint.toString)
+    IO.println (Json.arr points.toArray).compress
+  else
+    if installed.isEmpty then
+      IO.println "No hooks installed. Run 'beads hook init' to create sample hooks."
+    else
+      IO.println "Installed hooks:"
+      for point in installed do
+        IO.println s!"  {point.toString}"
+  pure 0
+
+/-- Command: show hook content -/
+def cmdHookShow (cfg : CLIConfig) (name : String) : IO UInt32 := do
+  match HookPoint.fromString? name with
+  | some point =>
+    let hm := HookManager.forDirectory cfg.beadsDir
+    match ← hm.read point with
+    | some content =>
+      if cfg.jsonOutput then
+        IO.println (Json.mkObj [
+          ("hook", Json.str name),
+          ("content", Json.str content)
+        ]).compress
+      else
+        IO.println content
+      pure 0
+    | none =>
+      IO.eprintln s!"Hook not installed: {name}"
+      pure 1
+  | none =>
+    IO.eprintln s!"Unknown hook point: {name}"
+    IO.eprintln s!"Valid hooks: {", ".intercalate (HookPoint.all.map HookPoint.toString)}"
+    pure 1
+
+/-- Command: initialize sample hooks -/
+def cmdHookInit (cfg : CLIConfig) : IO UInt32 := do
+  let hm := HookManager.forDirectory cfg.beadsDir
+  hm.initSamples
+
+  if cfg.jsonOutput then
+    IO.println (Json.mkObj [("initialized", Json.bool true)]).compress
+  else
+    IO.println "Created sample hooks in .beads/hooks/"
+    IO.println "Rename .sample files to activate (e.g., post-create.sample -> post-create)"
+  pure 0
+
+/-- Command: run a hook manually -/
+def cmdHookRun (cfg : CLIConfig) (name : String) : IO UInt32 := do
+  match HookPoint.fromString? name with
+  | some point =>
+    let hm := HookManager.forDirectory cfg.beadsDir
+    if !(← hm.exists point) then
+      IO.eprintln s!"Hook not installed: {name}"
+      pure 1
+    else
+      let result ← hm.run point []
+      if cfg.jsonOutput then
+        IO.println (toJson result).compress
+      else
+        if !result.output.isEmpty then
+          IO.println result.output
+        if result.success then
+          IO.println s!"Hook '{name}' completed successfully"
+        else
+          IO.println s!"Hook '{name}' failed with exit code {result.exitCode}"
+      pure (if result.success then 0 else 1)
+  | none =>
+    IO.eprintln s!"Unknown hook point: {name}"
+    pure 1
+
+/-- Command: remove a hook -/
+def cmdHookRemove (cfg : CLIConfig) (name : String) : IO UInt32 := do
+  match HookPoint.fromString? name with
+  | some point =>
+    let hm := HookManager.forDirectory cfg.beadsDir
+    if ← hm.remove point then
+      if cfg.jsonOutput then
+        IO.println (Json.mkObj [("removed", Json.bool true)]).compress
+      else
+        IO.println s!"Removed hook: {name}"
+      pure 0
+    else
+      IO.eprintln s!"Hook not installed: {name}"
+      pure 1
+  | none =>
+    IO.eprintln s!"Unknown hook point: {name}"
+    pure 1
+
+/-- Command: start file watcher -/
+def cmdWatch (cfg : CLIConfig) (args : List String) : IO UInt32 := do
+  -- Parse options
+  let autoSync := args.any (· == "--auto-sync")
+  let verbose := args.any (fun a => a == "--verbose" || a == "-v")
+
+  let intervalMs := match args with
+    | "--interval" :: n :: _ => n.toNat?.getD 5000
+    | _ => 5000
+
+  -- For testing, limit iterations
+  let maxIterations := match args with
+    | "--once" :: _ => some 1
+    | "--test" :: n :: _ => n.toNat?
+    | _ => none
+
+  let config : WatcherConfig := {
+    beadsDir := cfg.beadsDir
+    pollIntervalMs := intervalMs
+    autoSync := autoSync
+    verbose := verbose || !cfg.jsonOutput  -- Default to verbose in non-JSON mode
+  }
+
+  if cfg.jsonOutput then
+    IO.println (toJson config).compress
+
+  runWatcher config maxIterations
+  pure 0
+
 /-- Command: show version -/
 def cmdVersion (cfg : CLIConfig) : IO UInt32 := do
   let version := "0.1.0"
@@ -2062,6 +2354,17 @@ def printHelp : IO Unit := do
   IO.println "  batch assign <id1> ... <name>  Assign multiple issues"
   IO.println "  batch label --add <l> <ids>    Add label to multiple issues"
   IO.println "  edit <id>                      Edit an issue interactively"
+  IO.println "  log [--limit N]                Show activity log"
+  IO.println "  template list                  List available templates"
+  IO.println "  template show <name>           Show template details"
+  IO.println "  template init                  Create built-in templates"
+  IO.println "  template use <name> <title>    Create issue from template"
+  IO.println "  hook list                      List installed hooks"
+  IO.println "  hook show <name>               Show hook content"
+  IO.println "  hook init                      Create sample hook files"
+  IO.println "  hook run <name>                Run a hook manually"
+  IO.println "  hook remove <name>             Remove a hook"
+  IO.println "  watch [options]                Start file watcher daemon"
   IO.println "  version                        Show version info"
   IO.println "  help                           Show this help"
   IO.println ""
@@ -2152,6 +2455,19 @@ def main (args : List String) : IO UInt32 := do
   | "batch" :: "assign" :: rest => cmdBatchAssign cfg rest
   | "batch" :: "label" :: rest => cmdBatchLabel cfg rest
   | "edit" :: rest => cmdEdit cfg rest
+  | "log" :: rest => cmdLog cfg rest
+  | "template" :: "list" :: _ => cmdTemplateList cfg
+  | "template" :: "show" :: name :: _ => cmdTemplateShow cfg name
+  | "template" :: "init" :: _ => cmdTemplateInit cfg
+  | "template" :: "use" :: rest => cmdTemplateUse cfg rest
+  | "template" :: _ => cmdTemplateList cfg  -- Default to list
+  | "hook" :: "list" :: _ => cmdHookList cfg
+  | "hook" :: "show" :: name :: _ => cmdHookShow cfg name
+  | "hook" :: "init" :: _ => cmdHookInit cfg
+  | "hook" :: "run" :: name :: _ => cmdHookRun cfg name
+  | "hook" :: "remove" :: name :: _ => cmdHookRemove cfg name
+  | "hook" :: _ => cmdHookList cfg  -- Default to list
+  | "watch" :: rest => cmdWatch cfg rest
   | "version" :: _ => cmdVersion cfg
   | "sync" :: rest => cmdSync cfg rest
   | cmd :: _ =>

@@ -18,13 +18,14 @@ import { z } from "zod";
 
 // Path to beads binary - configurable via env
 const BEADS_BIN = process.env.BEADS_BIN || "beads";
-const BEADS_DIR = process.env.BEADS_DIR || ".beads";
+// Working directory for beads - defaults to cwd but can be overridden
+const BEADS_CWD = process.env.BEADS_CWD || process.cwd();
 
 // Helper to run beads CLI commands
 async function runBeads(args: string[]): Promise<{ success: boolean; output: string; parsed?: unknown }> {
   return new Promise((resolve) => {
     const proc = spawn(BEADS_BIN, ["--json", ...args], {
-      cwd: process.cwd(),
+      cwd: BEADS_CWD,
     });
 
     let stdout = "";

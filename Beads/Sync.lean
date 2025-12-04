@@ -14,6 +14,10 @@ import Beads.Sync.Merge
 import Beads.Sync.Export
 import Beads.Sync.Import
 import Beads.Sync.Git
+import Beads.Sync.ActivityLog
+import Beads.Sync.Templates
+import Beads.Sync.Hooks
+import Beads.Sync.Watcher
 
 namespace Beads.Sync
 -- Re-exports happen through imports
