@@ -915,6 +915,17 @@ def cmdDelete (cfg : CLIConfig) (args : List String) : IO UInt32 := do
         ops.deleteIssue issueId
         ops.save
 
+        -- Record deletion in manifest for sync
+        let now ← currentTimestamp
+        let deletionsPath := Sync.defaultPath cfg.beadsDir
+        let record : Sync.DeletionRecord := {
+          id := issueId
+          timestamp := now
+          actor := "cli"
+          reason := "deleted via CLI"
+        }
+        let _ ← Sync.appendDeletion deletionsPath record
+
         let text := s!"Deleted issue: {idStr} ({issue.title})"
         if cfg.jsonOutput then
           IO.println (Json.mkObj [
