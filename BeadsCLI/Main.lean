@@ -1888,7 +1888,8 @@ def cmdSync (cfg : CLIConfig) (args : List String) : IO UInt32 := do
   if flushOnly then
     let allIssues ← ops.getAllIssues
     if dryRun then
-      IO.println "→ [DRY RUN] Would export pending changes to JSONL"
+      if !cfg.jsonOutput then
+        IO.println "→ [DRY RUN] Would export pending changes to JSONL"
     else
       let result ← Sync.exportToJSONL allIssues jsonlPath
       if result.skipped then
@@ -1904,7 +1905,8 @@ def cmdSync (cfg : CLIConfig) (args : List String) : IO UInt32 := do
   if importOnly then
     let existingIssues ← ops.getAllIssues
     if dryRun then
-      IO.println "→ [DRY RUN] Would import from JSONL"
+      if !cfg.jsonOutput then
+        IO.println "→ [DRY RUN] Would import from JSONL"
     else
       let (_, importResult, sanitizeResult) ← Sync.importWithSanitization existingIssues jsonlPath
       if !cfg.jsonOutput then
@@ -1919,13 +1921,20 @@ def cmdSync (cfg : CLIConfig) (args : List String) : IO UInt32 := do
   let gitStatus ← Sync.getGitStatus beadsDir
 
   if dryRun then
-    IO.println "→ [DRY RUN] Sync preview:"
-    IO.println s!"  Repository: {if gitStatus.isRepo then "yes" else "no"}"
-    IO.println s!"  Branch: {gitStatus.currentBranch.getD "(unknown)"}"
-    IO.println s!"  Has upstream: {gitStatus.hasUpstream}"
-    IO.println s!"  Has local changes: {gitStatus.hasBeadsChanges}"
     if cfg.jsonOutput then
-      IO.println (Json.mkObj [("dry_run", Json.bool true)]).compress
+      IO.println (Json.mkObj [
+        ("dry_run", Json.bool true),
+        ("is_repo", Json.bool gitStatus.isRepo),
+        ("branch", match gitStatus.currentBranch with | some b => Json.str b | none => Json.null),
+        ("has_upstream", Json.bool gitStatus.hasUpstream),
+        ("has_changes", Json.bool gitStatus.hasBeadsChanges)
+      ]).compress
+    else
+      IO.println "→ [DRY RUN] Sync preview:"
+      IO.println s!"  Repository: {if gitStatus.isRepo then "yes" else "no"}"
+      IO.println s!"  Branch: {gitStatus.currentBranch.getD "(unknown)"}"
+      IO.println s!"  Has upstream: {gitStatus.hasUpstream}"
+      IO.println s!"  Has local changes: {gitStatus.hasBeadsChanges}"
     return 0
 
   -- Step 1: Export pending changes
