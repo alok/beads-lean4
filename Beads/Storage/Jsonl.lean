@@ -4,6 +4,7 @@ File-backed storage using JSONL format for git compatibility
 -/
 import Beads.Storage.Storage
 import Beads.Core.Id
+import Beads.Core.Validated
 import Lean.Data.Json
 
 namespace Beads
@@ -158,9 +159,6 @@ def loadIssues (storage : JsonlStorage) : IO Unit := do
 def hashMapFindD {α β : Type} [BEq α] [Hashable α] (m : Std.HashMap α β) (k : α) (d : β) : β :=
   m.get? k |>.getD d
 
-/-- Helper: check if haystack contains needle as substring -/
-def containsSubstr (haystack needle : String) : Bool :=
-  needle.isEmpty || (haystack.splitOn needle).length > 1
 
 /-- Save comments to JSONL file -/
 def saveComments (storage : JsonlStorage) : IO Unit := do
@@ -295,7 +293,7 @@ def toStorageOps (storage : JsonlStorage) : StorageOps := {
       (match filter.priority with | some p => issue.priority == p | none => true) &&
       (match filter.issueType with | some t => issue.issueType == t | none => true) &&
       (match filter.assignee with | some a => issue.assignee == some a | none => true) &&
-      (if filter.titleSearch.isEmpty then true else containsSubstr issue.title filter.titleSearch) &&
+      (if filter.titleSearch.isEmpty then true else hasSubstr issue.title filter.titleSearch) &&
       (if filter.ids.isEmpty then true else filter.ids.contains issue.id)
     pure (filtered.take filter.limit)
 
@@ -347,8 +345,7 @@ def toStorageOps (storage : JsonlStorage) : StorageOps := {
   addComment := fun issueId text author => do
     let id ← storage.nextCommentId.get
     storage.nextCommentId.set (id + 1)
-    let now ← IO.Process.output { cmd := "date", args := #["+%s"] }
-    let timestamp := now.stdout.trim.toNat?.getD 0
+    let timestamp ← IO.monoMsNow
     let comment : Comment := {
       id := id
       issueId := issueId
@@ -369,8 +366,7 @@ def toStorageOps (storage : JsonlStorage) : StorageOps := {
   sendMessage := fun sender recipient subject body relatedIssue => do
     let id ← storage.nextMessageId.get
     storage.nextMessageId.set (id + 1)
-    let now ← IO.Process.output { cmd := "date", args := #["+%s"] }
-    let timestamp := now.stdout.trim.toNat?.getD 0
+    let timestamp ← IO.monoMsNow
     let msg : Message := {
       id := id
       sender := sender
@@ -395,15 +391,13 @@ def toStorageOps (storage : JsonlStorage) : StorageOps := {
     pure (messages.find? (·.id == id))
 
   markRead := fun id => do
-    let now ← IO.Process.output { cmd := "date", args := #["+%s"] }
-    let timestamp := now.stdout.trim.toNat?.getD 0
+    let timestamp ← IO.monoMsNow
     storage.messages.modify fun ms =>
       ms.map fun m => if m.id == id then { m with readAt := some timestamp } else m
     storage.dirty.set true
 
   markAcked := fun id => do
-    let now ← IO.Process.output { cmd := "date", args := #["+%s"] }
-    let timestamp := now.stdout.trim.toNat?.getD 0
+    let timestamp ← IO.monoMsNow
     storage.messages.modify fun ms =>
       ms.map fun m => if m.id == id then { m with ackedAt := some timestamp } else m
     storage.dirty.set true

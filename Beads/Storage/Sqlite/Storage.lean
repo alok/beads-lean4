@@ -274,8 +274,12 @@ def toStorageOps (storage : SqliteStorage) : StorageOps := {
         finalize stmt
 
   deleteIssue := fun id => do
-    match ← exec storage.db s!"DELETE FROM issues WHERE id = '{id.value}'" with
-    | _ => return ()
+    match ← prepare storage.db "DELETE FROM issues WHERE id = ?" with
+    | .error _ => return ()
+    | .ok stmt =>
+      bindText stmt 1 id.value
+      discard <| step stmt
+      finalize stmt
 
   getAllIssues := do
     let sql := "SELECT id, title, description, design, acceptance_criteria, notes, status, priority, issue_type, assignee, estimated_minutes, created_at, updated_at, closed_at, close_reason, external_ref FROM issues"
@@ -322,20 +326,27 @@ def toStorageOps (storage : SqliteStorage) : StorageOps := {
       return .ok ()
 
   removeDependency := fun issueId dependsOnId _actor => do
-    match ← exec storage.db s!"DELETE FROM dependencies WHERE issue_id = '{issueId.value}' AND depends_on_id = '{dependsOnId.value}'" with
-    | _ => return ()
+    match ← prepare storage.db "DELETE FROM dependencies WHERE issue_id = ? AND depends_on_id = ?" with
+    | .error _ => return ()
+    | .ok stmt =>
+      bindText stmt 1 issueId.value
+      bindText stmt 2 dependsOnId.value
+      discard <| step stmt
+      finalize stmt
 
   getDependencies := fun issueId => do
-    let sql := s!"SELECT issue_id, depends_on_id, dep_type, created_at, created_by FROM dependencies WHERE issue_id = '{issueId.value}'"
-    match ← prepare storage.db sql with
+    match ← prepare storage.db "SELECT issue_id, depends_on_id, dep_type, created_at, created_by FROM dependencies WHERE issue_id = ?" with
     | .error _ => return []
-    | .ok stmt => Statement.collectRows stmt readDependency
+    | .ok stmt =>
+      bindText stmt 1 issueId.value
+      Statement.collectRows stmt readDependency
 
   getDependents := fun issueId => do
-    let sql := s!"SELECT issue_id, depends_on_id, dep_type, created_at, created_by FROM dependencies WHERE depends_on_id = '{issueId.value}'"
-    match ← prepare storage.db sql with
+    match ← prepare storage.db "SELECT issue_id, depends_on_id, dep_type, created_at, created_by FROM dependencies WHERE depends_on_id = ?" with
     | .error _ => return []
-    | .ok stmt => Statement.collectRows stmt readDependency
+    | .ok stmt =>
+      bindText stmt 1 issueId.value
+      Statement.collectRows stmt readDependency
 
   getAllDependencies := do
     let sql := "SELECT issue_id, depends_on_id, dep_type, created_at, created_by FROM dependencies"
@@ -354,32 +365,35 @@ def toStorageOps (storage : SqliteStorage) : StorageOps := {
       finalize stmt
 
   removeLabel := fun issueId label _actor => do
-    match ← exec storage.db s!"DELETE FROM labels WHERE issue_id = '{issueId.value}' AND label = '{label}'" with
-    | _ => return ()
+    match ← prepare storage.db "DELETE FROM labels WHERE issue_id = ? AND label = ?" with
+    | .error _ => return ()
+    | .ok stmt =>
+      bindText stmt 1 issueId.value
+      bindText stmt 2 label
+      discard <| step stmt
+      finalize stmt
 
   getLabels := fun issueId => loadLabels storage.db issueId
 
   addComment := fun issueId text author => do
-    let now ← IO.Process.output { cmd := "date", args := #["+%s"] }
-    let timestamp := now.stdout.trim.toNat?.getD 0
-    let sql := s!"INSERT INTO comments (issue_id, author, text, created_at) VALUES ('{issueId.value}', '{author}', '{text.replace "'" "''"}', {timestamp}) RETURNING id"
-    match ← prepare storage.db sql with
+    let timestamp ← IO.monoMsNow
+    match ← prepare storage.db "INSERT INTO comments (issue_id, author, text, created_at) VALUES (?, ?, ?, ?)" with
     | .error _ => return 0
     | .ok stmt =>
-      let rc ← step stmt
-      if rc == SQLITE_ROW then
-        let id ← columnInt stmt 0
-        finalize stmt
-        return id.toNat
-      else
-        finalize stmt
-        return 0
+      bindText stmt 1 issueId.value
+      bindText stmt 2 author
+      bindText stmt 3 text
+      bindInt stmt 4 timestamp
+      discard <| step stmt
+      finalize stmt
+      let rowid ← lastInsertRowid storage.db
+      return rowid.toNat
 
   getComments := fun issueId => do
-    let sql := s!"SELECT id, issue_id, author, text, created_at FROM comments WHERE issue_id = '{issueId.value}' ORDER BY created_at ASC"
-    match ← prepare storage.db sql with
+    match ← prepare storage.db "SELECT id, issue_id, author, text, created_at FROM comments WHERE issue_id = ? ORDER BY created_at ASC" with
     | .error _ => return []
     | .ok stmt =>
+      bindText stmt 1 issueId.value
       let mut comments : List Comment := []
       let mut running := true
       while running do
@@ -418,27 +432,26 @@ def toStorageOps (storage : SqliteStorage) : StorageOps := {
       return comments.reverse
 
   sendMessage := fun sender recipient subject body relatedIssue => do
-    let now ← IO.Process.output { cmd := "date", args := #["+%s"] }
-    let timestamp := now.stdout.trim.toNat?.getD 0
-    let relatedIssueVal := match relatedIssue with | some id => s!"'{id.value}'" | none => "NULL"
-    let sql := s!"INSERT INTO messages (from_agent, to_agent, subject, body, created_at, related_issue) VALUES ('{sender}', '{recipient}', '{subject.replace "'" "''"}', '{body.replace "'" "''"}', {timestamp}, {relatedIssueVal}) RETURNING id"
-    match ← prepare storage.db sql with
+    let timestamp ← IO.monoMsNow
+    match ← prepare storage.db "INSERT INTO messages (from_agent, to_agent, subject, body, created_at, related_issue) VALUES (?, ?, ?, ?, ?, ?)" with
     | .error _ => return 0
     | .ok stmt =>
-      let rc ← step stmt
-      if rc == SQLITE_ROW then
-        let id ← columnInt stmt 0
-        finalize stmt
-        return id.toNat
-      else
-        finalize stmt
-        return 0
+      bindText stmt 1 sender
+      bindText stmt 2 recipient
+      bindText stmt 3 subject
+      bindText stmt 4 body
+      bindInt stmt 5 timestamp
+      Statement.bindTextOpt stmt 6 (relatedIssue.map (·.value))
+      discard <| step stmt
+      finalize stmt
+      let rowid ← lastInsertRowid storage.db
+      return rowid.toNat
 
   getInbox := fun recipientArg => do
-    let sql := s!"SELECT id, from_agent, to_agent, subject, body, created_at, read_at, acked_at, related_issue FROM messages WHERE to_agent = '{recipientArg}' ORDER BY created_at DESC"
-    match ← prepare storage.db sql with
+    match ← prepare storage.db "SELECT id, from_agent, to_agent, subject, body, created_at, read_at, acked_at, related_issue FROM messages WHERE to_agent = ? ORDER BY created_at DESC" with
     | .error _ => return []
     | .ok stmt =>
+      bindText stmt 1 recipientArg
       let mut messages : List Message := []
       let mut running := true
       while running do
@@ -461,10 +474,10 @@ def toStorageOps (storage : SqliteStorage) : StorageOps := {
       return messages.reverse
 
   getMessage := fun id => do
-    let sql := s!"SELECT id, from_agent, to_agent, subject, body, created_at, read_at, acked_at, related_issue FROM messages WHERE id = {id}"
-    match ← prepare storage.db sql with
+    match ← prepare storage.db "SELECT id, from_agent, to_agent, subject, body, created_at, read_at, acked_at, related_issue FROM messages WHERE id = ?" with
     | .error _ => return none
     | .ok stmt =>
+      bindInt stmt 1 id
       let rc ← step stmt
       if rc == SQLITE_ROW then
         let msgId := (← columnInt stmt 0).toNat
@@ -484,16 +497,24 @@ def toStorageOps (storage : SqliteStorage) : StorageOps := {
         return none
 
   markRead := fun id => do
-    let now ← IO.Process.output { cmd := "date", args := #["+%s"] }
-    let timestamp := now.stdout.trim.toNat?.getD 0
-    let sql := s!"UPDATE messages SET read_at = {timestamp} WHERE id = {id}"
-    discard <| exec storage.db sql
+    let timestamp ← IO.monoMsNow
+    match ← prepare storage.db "UPDATE messages SET read_at = ? WHERE id = ?" with
+    | .error _ => return ()
+    | .ok stmt =>
+      bindInt stmt 1 timestamp
+      bindInt stmt 2 id
+      discard <| step stmt
+      finalize stmt
 
   markAcked := fun id => do
-    let now ← IO.Process.output { cmd := "date", args := #["+%s"] }
-    let timestamp := now.stdout.trim.toNat?.getD 0
-    let sql := s!"UPDATE messages SET acked_at = {timestamp} WHERE id = {id}"
-    discard <| exec storage.db sql
+    let timestamp ← IO.monoMsNow
+    match ← prepare storage.db "UPDATE messages SET acked_at = ? WHERE id = ?" with
+    | .error _ => return ()
+    | .ok stmt =>
+      bindInt stmt 1 timestamp
+      bindInt stmt 2 id
+      discard <| step stmt
+      finalize stmt
 
   getAllMessages := do
     let sql := "SELECT id, from_agent, to_agent, subject, body, created_at, read_at, acked_at, related_issue FROM messages ORDER BY created_at DESC"
@@ -601,16 +622,18 @@ def toStorageOps (storage : SqliteStorage) : StorageOps := {
 }
 where
   loadLabels (db : Database) (issueId : IssueId) : IO (List String) := do
-    let sql := s!"SELECT label FROM labels WHERE issue_id = '{issueId.value}'"
-    match ← prepare db sql with
+    match ← prepare db "SELECT label FROM labels WHERE issue_id = ?" with
     | .error _ => return []
-    | .ok stmt => Statement.collectRows stmt (columnText · 0)
+    | .ok stmt =>
+      bindText stmt 1 issueId.value
+      Statement.collectRows stmt (columnText · 0)
 
   getBlockersFor (db : Database) (issueId : IssueId) : IO (List IssueId) := do
-    let sql := s!"SELECT d.depends_on_id FROM dependencies d JOIN issues i ON d.depends_on_id = i.id WHERE d.issue_id = '{issueId.value}' AND d.dep_type IN ('blocks', 'parent-child') AND i.status != 'closed'"
-    match ← prepare db sql with
+    match ← prepare db "SELECT d.depends_on_id FROM dependencies d JOIN issues i ON d.depends_on_id = i.id WHERE d.issue_id = ? AND d.dep_type IN ('blocks', 'parent-child') AND i.status != 'closed'" with
     | .error _ => return []
-    | .ok stmt => Statement.collectRows stmt (fun s => return ⟨← columnText s 0⟩)
+    | .ok stmt =>
+      bindText stmt 1 issueId.value
+      Statement.collectRows stmt (fun s => return ⟨← columnText s 0⟩)
 
   wouldCreateCycle (db : Database) (from_ to : IssueId) : IO Bool := do
     -- BFS from 'to' to see if we can reach 'from_'
@@ -618,22 +641,25 @@ where
     let mut visited : Std.HashSet IssueId := {}
     let mut fuel := 1000
 
-    while !queue.isEmpty && fuel > 0 do
-      fuel := fuel - 1
-      match queue with
-      | [] => break
-      | current :: rest =>
-        queue := rest
-        if current == from_ then
-          return true
-        if visited.contains current then
-          continue
-        visited := visited.insert current
-        -- Get dependencies of current
-        let sql := s!"SELECT depends_on_id FROM dependencies WHERE issue_id = '{current.value}'"
-        match ← prepare db sql with
-        | .error _ => pure ()
-        | .ok stmt =>
+    -- Prepare the statement once and reuse
+    match ← prepare db "SELECT depends_on_id FROM dependencies WHERE issue_id = ?" with
+    | .error _ => return false
+    | .ok stmt =>
+      while !queue.isEmpty && fuel > 0 do
+        fuel := fuel - 1
+        match queue with
+        | [] => break
+        | current :: rest =>
+          queue := rest
+          if current == from_ then
+            finalize stmt
+            return true
+          if visited.contains current then
+            continue
+          visited := visited.insert current
+          -- Get dependencies of current
+          reset stmt
+          bindText stmt 1 current.value
           let mut running := true
           while running do
             let rc ← step stmt
@@ -642,9 +668,8 @@ where
               queue := ⟨depId⟩ :: queue
             else
               running := false
-          finalize stmt
-
-    return false
+      finalize stmt
+      return false
 
 /-- Open or create SQLite storage -/
 def openOrCreate (path : System.FilePath := ".beads/beads.db") : IO (Except String SqliteStorage) := do

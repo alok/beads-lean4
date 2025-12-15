@@ -96,9 +96,7 @@ def detectChanges (oldStates newStates : List FileState) : List String := Id.run
   return changes.reverse
 
 /-- Current unix timestamp -/
-def watcherTimestamp : IO Nat := do
-  let result ← IO.Process.output { cmd := "date", args := #["+%s"] }
-  return result.stdout.trim.toNat?.getD 0
+def watcherTimestamp : IO Nat := IO.monoMsNow
 
 /-- Sleep for milliseconds -/
 def sleepMs (ms : Nat) : IO Unit := do

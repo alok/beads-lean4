@@ -88,11 +88,7 @@ def formatIssueLong (issue : Issue) : String :=
   "\n".intercalate (lines.filter (!·.isEmpty))
 
 /-- Get current unix timestamp from system -/
-def currentTimestamp : IO Nat := do
-  let result ← IO.Process.output { cmd := "date", args := #["+%s"] }
-  match result.stdout.trim.toNat? with
-  | some n => pure n
-  | none => pure 0  -- Fallback if date command fails
+def currentTimestamp : IO Nat := IO.monoMsNow
 
 /-- Parse create options from args -/
 def parseCreateOpts (args : List String) : (Option IssueType × Option Priority × List String) :=
